@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+yt-dlp>=2026.7.4
+faster-whisper==1.1.1
+pyttsx3==2.99
+gTTS>=2.5.4
+edge-tts>=7.2.8
+deep-translator>=1.11.4
+numpy>=2.0.0
+requests>=2.34.0
+vieneu>=3.2.5
+torch>=2.0.0
+torchaudio>=2.0.0
