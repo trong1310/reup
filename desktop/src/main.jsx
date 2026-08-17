@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useMemo, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
+import ApiKeyModal from "./ApiKeyModal";
 
 const API = "http://127.0.0.1:8787";
 
@@ -23,10 +24,12 @@ function App() {
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [isApiModalOpen, setIsApiModalOpen] = useState(false);
+  const [apiSettings, setApiSettings] = useState(null);
 
   const timerRef = useRef(null);
 
-  useEffect(() => {
+  const loadVoices = () => {
     fetch(`${API}/api/voices`)
       .then(r => r.json())
       .then(data => {
@@ -37,6 +40,20 @@ function App() {
         }
       })
       .catch(() => {});
+  };
+
+  const loadSettings = () => {
+    fetch(`${API}/api/settings`)
+      .then(r => r.json())
+      .then(data => {
+        setApiSettings(data);
+      })
+      .catch(() => {});
+  };
+
+  useEffect(() => {
+    loadVoices();
+    loadSettings();
   }, []);
 
   const jobId = job?.id || job?.job_id;
@@ -158,8 +175,59 @@ function App() {
     return "";
   };
 
+  const activeApisCount = useMemo(() => {
+    if (!apiSettings) return 0;
+    let count = 0;
+    if (apiSettings.has_groq) count++;
+    if (apiSettings.has_gemini) count++;
+    if (apiSettings.has_openai) count++;
+    if (apiSettings.has_elevenlabs) count++;
+    if (apiSettings.has_hf) count++;
+    return count;
+  }, [apiSettings]);
+
+  const activeProviderLabels = useMemo(() => {
+    if (!apiSettings) return [];
+    const list = [];
+    if (apiSettings.has_groq) list.push("Groq 1s");
+    if (apiSettings.has_gemini) list.push("Gemini Flash");
+    if (apiSettings.has_openai) list.push("OpenAI");
+    if (apiSettings.has_elevenlabs) list.push("ElevenLabs");
+    return list;
+  }, [apiSettings]);
+
   return (
     <main className="page">
+      {/* Top Navigation Bar */}
+      <header className="top-nav">
+        <div className="nav-brand">
+          <div className="nav-logo">⚡</div>
+          <div className="nav-title">
+            <span className="brand-name">AI Video Dubber</span>
+            <span className="brand-tag">PRO ACCELERATOR</span>
+          </div>
+        </div>
+
+        <button
+          className="api-config-btn"
+          onClick={() => setIsApiModalOpen(true)}
+          title="Mở bảng cấu hình API Key bên thứ 3 để tăng tốc độ xử lý"
+        >
+          <span className="api-btn-icon">⚡</span>
+          <div className="api-btn-content">
+            <span className="api-btn-title">Cấu Hình API Key (Tăng Tốc 10x)</span>
+            <span className="api-btn-subtitle">
+              {activeApisCount > 0 ? (
+                <span className="active-text">🟢 {activeApisCount} API Đã Kích Hoạt ({activeProviderLabels.join(", ")})</span>
+              ) : (
+                <span className="inactive-text">⚪ Chưa kích hoạt Cloud API (Đang chạy CPU)</span>
+              )}
+            </span>
+          </div>
+          <span className="api-btn-arrow">⚙️</span>
+        </button>
+      </header>
+
       <section className="hero">
         <div>
           <div className="badge">
@@ -167,7 +235,7 @@ function App() {
             AI VIDEO DUBBER & DỊCH THUẬT TỰ ĐỘNG
           </div>
           <h1>Dán link video.<br />Tạo video lồng tiếng AI.</h1>
-          <p>Tải video Douyin/TikTok/YouTube → Tự động nhận diện → Dịch thuật chuẩn xác → Lồng tiếng AI (Ngọc Huyền v2, Hoài My, Google...) → Xuất video MP4 & Phụ đề SRT.</p>
+          <p>Tải video Douyin/TikTok/YouTube → Tự động nhận diện (Groq/Whisper) → Dịch thuật thông minh (Gemini/Llama) → Lồng tiếng AI (VieNeu, OpenAI, ElevenLabs, Edge-TTS) → Xuất video MP4 & Phụ đề SRT.</p>
         </div>
       </section>
 
@@ -253,16 +321,28 @@ function App() {
 
         <div className="options">
           <div className="option">
-            <strong>✓ Xử lý cục bộ đa luồng</strong>
-            <span>Whisper AI và VieNeu-TTS chạy trực tiếp không giới hạn ký tự.</span>
+            <strong>
+              {apiSettings?.has_groq ? "⚡ Siêu tốc Groq Whisper" : "✓ Nhận diện Whisper"}
+            </strong>
+            <span>
+              {apiSettings?.has_groq
+                ? "Đang kích hoạt Groq Whisper Cloud: Xử lý âm thanh chỉ trong ~1 giây."
+                : "Nhận diện giọng nói chuẩn xác bằng Whisper AI (Bấm Cài Đặt API để tăng tốc 10x)."}
+            </span>
           </div>
           <div className="option">
-            <strong>✓ Giữ âm thanh nền</strong>
-            <span>Tự động cân bằng và mix nhạc nền gốc với giọng đọc lồng tiếng.</span>
+            <strong>
+              {apiSettings?.has_gemini ? "🚀 Dịch thuật Gemini Flash" : "✓ Dịch thuật thông minh"}
+            </strong>
+            <span>
+              {apiSettings?.has_gemini
+                ? "Đang dùng Google Gemini Flash: Phụ đề dịch tự nhiên, chuẩn ngữ cảnh lồng tiếng."
+                : "Tự động dịch sang tiếng Việt và cân bằng thời lượng khớp khẩu hình nhân vật."}
+            </span>
           </div>
           <div className="option">
-            <strong>✓ Hỗ trợ phụ đề SRT</strong>
-            <span>Tự động tạo file phụ đề .srt chính xác từng giây để gắn vào video.</span>
+            <strong>✓ Lồng tiếng & Xuất SRT</strong>
+            <span>Đồng bộ chính xác từng mili-giây, giữ trọn âm thanh và nhạc nền gốc.</span>
           </div>
         </div>
 
@@ -329,6 +409,17 @@ function App() {
 
         {error && <div className="error">{error}</div>}
       </section>
+
+      {/* API Key Modal */}
+      <ApiKeyModal
+        isOpen={isApiModalOpen}
+        onClose={() => setIsApiModalOpen(false)}
+        apiBase={API}
+        onSettingsSaved={(newSettings) => {
+          setApiSettings(newSettings);
+          loadVoices();
+        }}
+      />
     </main>
   );
 }

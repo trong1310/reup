@@ -1,29 +1,94 @@
-# compiled output
-/dist
-desktop/node_modules
-/build
-/uploads
-/engine/.venv
-/engine/data
+# Environment & Secrets
+.env
+*.env
+!.env.example
+.env.local
+.env.*.local
+
+# Portable & Distribution Builds
+AI-Video-Dubber-macOS/
+AI-Video-Dubber-Portable/
+AI-Video-Dubber-macOS*.zip
+AI-Video-Dubber-Portable*.zip
+tools/
+*.zip
 
 # Logs
-logs
+logs/
 *.log
+engine/logError/
+
+
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+env/
+engine/.venv/
+
+# Node & Package Managers
+node_modules/
+desktop/node_modules/
+/dist
+/build
+/out
 npm-debug.log*
-pnpm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
 lerna-debug.log*
+
+# Media & Generated audio/video files
+*.mp3
+*.mp4
+*.mkv
+*.avi
+*.webm
+/engine/data/
+
+# Preserve voice reference files
+!engine/voices/*.wav
+
+# Logs
+logs/
+*.log
+
+# Temp directory
+.temp/
+.tmp/
 
 # OS
 .DS_Store
+Thumbs.db
+desktop.ini
 
-# Tests
+# Tests & Coverage
 /coverage
 /.nyc_output
 
-# IDEs and editors
-/.idea
+# IDEs & Editors
+.idea/
 .project
 .classpath
 .c9/
@@ -38,15 +103,9 @@ lerna-debug.log*
 !.vscode/launch.json
 !.vscode/extensions.json
 
-# temp directory
-.temp
-.tmp
-
-# Runtime data
+# Runtime data & Diagnostics
 pids
 *.pid
 *.seed
 *.pid.lock
-
-# Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json

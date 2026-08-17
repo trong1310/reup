@@ -1,27 +1,68 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import os
 import re
 import shutil
 import subprocess
 import threading
+import traceback
 from pathlib import Path
 from typing import Any
 
 import edge_tts
 import numpy as np
+# pyrefly: ignore [missing-import]
 import pyttsx3
 import requests
 import yt_dlp
 from deep_translator import GoogleTranslator
 from faster_whisper import WhisperModel
+# pyrefly: ignore [missing-import]
 from gtts import gTTS
 from pydub import AudioSegment
 
 BASE_DIR = Path(__file__).resolve().parents[1]
+LOG_ERROR_DIR = BASE_DIR / "logError"
+_log_lock = threading.Lock()
 _vieneu_instance = None
+
+
+def log_error_to_file(
+    error_msg: str,
+    exc: Exception | None = None,
+    job_id: str | None = None,
+    context: dict[str, Any] | None = None,
+):
+    try:
+        LOG_ERROR_DIR.mkdir(parents=True, exist_ok=True)
+        now = datetime.datetime.now()
+        filename = now.strftime("%d-%m-%Y.txt")
+        log_file = LOG_ERROR_DIR / filename
+
+        timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        entry_lines = [
+            f"==================== [{timestamp_str}] ====================",
+        ]
+        if job_id:
+            entry_lines.append(f"Job ID: {job_id}")
+        if context:
+            entry_lines.append(f"Context: {json.dumps(context, ensure_ascii=False)}")
+        entry_lines.append(f"Error: {error_msg}")
+        if exc is not None:
+            tb = traceback.format_exc()
+            if tb and tb.strip() != "NoneType: None":
+                entry_lines.append("Traceback:")
+                entry_lines.append(tb.strip())
+        entry_lines.append("============================================================\n")
+
+        with _log_lock:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write("\n".join(entry_lines) + "\n")
+    except Exception as e:
+        print(f"Failed to write error log: {e}")
 
 
 def get_vieneu_instance():
@@ -132,8 +173,67 @@ class JobManager:
                 encoding="utf-8",
             )
 
+            segments = translated.get("segments", [])
+            valid_segments = [s for s in segments if s.get("text", "").strip()]
+
             srt_file = work / "subtitles.srt"
-            generate_srt(translated.get("segments", []), srt_file)
+            generate_srt(valid_segments, srt_file)
+
+            sub_style = req.get("subtitle_style", "blur_yellow")
+            clean_sub_req = req.get("clean_sub_mode")
+            burn_subs_req = req.get("burn_subtitles")
+
+            # Determine clean_sub_mode and ass_style
+            if sub_style == "blur_yellow":
+                clean_sub_mode = "blur"
+                ass_style = "yellow"
+                burn_subs = True
+            elif sub_style == "blur_white":
+                clean_sub_mode = "blur"
+                ass_style = "white"
+                burn_subs = True
+            elif sub_style in ("mask_white", "mask"):
+                clean_sub_mode = "mask"
+                ass_style = "white"
+                burn_subs = True
+            elif sub_style == "mask_yellow":
+                clean_sub_mode = "mask"
+                ass_style = "yellow"
+                burn_subs = True
+            elif sub_style == "box":
+                clean_sub_mode = "none"
+                ass_style = "box"
+                burn_subs = True
+            elif sub_style in ("outline", "outline_yellow"):
+                clean_sub_mode = "none"
+                ass_style = "yellow"
+                burn_subs = True
+            elif sub_style in ("white_outline", "outline_white"):
+                clean_sub_mode = "none"
+                ass_style = "white"
+                burn_subs = True
+            elif sub_style == "only_remove_sub":
+                clean_sub_mode = "blur"
+                ass_style = "none"
+                burn_subs = False
+            elif sub_style == "none":
+                clean_sub_mode = "none"
+                ass_style = "none"
+                burn_subs = False
+            else:
+                clean_sub_mode = "blur"
+                ass_style = "yellow"
+                burn_subs = True
+
+            if clean_sub_req is not None:
+                clean_sub_mode = str(clean_sub_req).lower()
+            if burn_subs_req is not None:
+                burn_subs = bool(burn_subs_req)
+
+            ass_file = None
+            if burn_subs and valid_segments and ass_style != "none":
+                ass_file = work / "subtitles.ass"
+                generate_ass(valid_segments, ass_file, style_type=ass_style, video_path=video)
 
             self.update(job_id, stage="tts", progress=70)
             speech = work / "dub.mp3"
@@ -154,7 +254,7 @@ class JobManager:
             self.update(job_id, stage="mix_and_render", progress=90)
             output = work / "output.mp4"
 
-            mix_audio(video, speech, output)
+            mix_audio(video, speech, output, subtitle_file=ass_file, clean_sub_mode=clean_sub_mode)
 
             self.update(
                 job_id,
@@ -164,14 +264,167 @@ class JobManager:
                 output=str(output),
             )
         except Exception as exc:
+            err_msg = f"{type(exc).__name__}: {exc}"
             self.update(
                 job_id,
                 status="failed",
                 stage="error",
-                error=f"{type(exc).__name__}: {exc}",
+                error=err_msg,
             )
+            req = job.get("request") if "job" in locals() and job else None
+            log_error_to_file(err_msg, exc=exc, job_id=job_id, context=req)
+
+def transcribe_with_groq(audio: Path, language: str | None = None) -> dict | None:
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        return None
+    url = "https://api.groq.com/openai/v1/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    data: dict[str, Any] = {
+        "model": "whisper-large-v3-turbo",
+        "response_format": "verbose_json",
+        "temperature": "0.0",
+    }
+    if language and language.lower() not in ("auto", ""):
+        data["language"] = language.lower()
+
+    try:
+        with open(audio, "rb") as f:
+            files = {"file": (audio.name, f, "audio/wav")}
+            resp = requests.post(url, headers=headers, data=data, files=files, timeout=60)
+        
+        if resp.status_code == 200:
+            res_json = resp.json()
+            raw_segs = res_json.get("segments", [])
+            segments = []
+            for s in raw_segs:
+                text = s.get("text", "").strip()
+                if text:
+                    segments.append({
+                        "start": float(s.get("start", 0.0)),
+                        "end": float(s.get("end", 0.0)),
+                        "text": text,
+                    })
+            if segments:
+                print(f"[Speedup] Groq Whisper Cloud transcribed {len(segments)} segments in ~1s!")
+                return {
+                    "language": res_json.get("language", language or "auto"),
+                    "language_probability": 1.0,
+                    "segments": segments,
+                }
+        else:
+            print(f"Groq Whisper notice ({resp.status_code}): {resp.text[:200]}")
+    except Exception as e:
+        print(f"Groq Whisper exception: {e}")
+    return None
+
+
+def transcribe_with_openai(audio: Path, language: str | None = None) -> dict | None:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    url = "https://api.openai.com/v1/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    data: dict[str, Any] = {
+        "model": "whisper-1",
+        "response_format": "verbose_json",
+    }
+    if language and language.lower() not in ("auto", ""):
+        data["language"] = language.lower()
+
+    try:
+        with open(audio, "rb") as f:
+            files = {"file": (audio.name, f, "audio/wav")}
+            resp = requests.post(url, headers=headers, data=data, files=files, timeout=90)
+        
+        if resp.status_code == 200:
+            res_json = resp.json()
+            raw_segs = res_json.get("segments", [])
+            segments = []
+            for s in raw_segs:
+                text = s.get("text", "").strip()
+                if text:
+                    segments.append({
+                        "start": float(s.get("start", 0.0)),
+                        "end": float(s.get("end", 0.0)),
+                        "text": text,
+                    })
+            if segments:
+                print(f"[Speedup] OpenAI Whisper Cloud transcribed {len(segments)} segments!")
+                return {
+                    "language": res_json.get("language", language or "auto"),
+                    "language_probability": 1.0,
+                    "segments": segments,
+                }
+        else:
+            print(f"OpenAI Whisper notice ({resp.status_code}): {resp.text[:200]}")
+    except Exception as e:
+        print(f"OpenAI Whisper exception: {e}")
+    return None
+
+
+def transcribe_with_deepgram(audio: Path, language: str | None = None) -> dict | None:
+    api_key = os.getenv("DEEPGRAM_API_KEY", "").strip()
+    if not api_key:
+        return None
+    url = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&utterances=true&punctuate=true"
+    if language and language.lower() not in ("auto", ""):
+        url += f"&language={language.lower()}"
+    headers = {
+        "Authorization": f"Token {api_key}",
+        "Content-Type": "audio/wav",
+    }
+    try:
+        with open(audio, "rb") as f:
+            resp = requests.post(url, headers=headers, data=f.read(), timeout=60)
+        if resp.status_code == 200:
+            res_json = resp.json()
+            results = res_json.get("results", {})
+            utterances = results.get("utterances", [])
+            segments = []
+            for u in utterances:
+                t = u.get("transcript", "").strip()
+                if t:
+                    segments.append({
+                        "start": float(u.get("start", 0.0)),
+                        "end": float(u.get("end", 0.0)),
+                        "text": t,
+                    })
+            if segments:
+                print(f"[Speedup] Deepgram Nova-2 transcribed {len(segments)} utterances!")
+                return {
+                    "language": language or "auto",
+                    "language_probability": 1.0,
+                    "segments": segments,
+                }
+    except Exception as e:
+        print(f"Deepgram exception: {e}")
+    return None
+
 
     def transcribe(self, audio: Path, language: str):
+        stt_pref = os.getenv("STT_PROVIDER", "auto").lower()
+        lang_code = None if language.lower() in ("auto", "") else language
+
+        # 1. Groq Whisper Cloud (Siêu tốc 1s)
+        if stt_pref == "groq" or (stt_pref == "auto" and os.getenv("GROQ_API_KEY")):
+            res = transcribe_with_groq(audio, lang_code)
+            if res:
+                return res
+
+        # 2. OpenAI Whisper Cloud
+        if stt_pref == "openai" or (stt_pref == "auto" and os.getenv("OPENAI_API_KEY")):
+            res = transcribe_with_openai(audio, lang_code)
+            if res:
+                return res
+
+        # 3. Deepgram Cloud
+        if stt_pref == "deepgram" or (stt_pref == "auto" and os.getenv("DEEPGRAM_API_KEY")):
+            res = transcribe_with_deepgram(audio, lang_code)
+            if res:
+                return res
+
+        # 4. Fallback to Local Faster-Whisper
         if self._whisper is None:
             model_name = os.getenv("WHISPER_MODEL", "base")
             device = os.getenv("WHISPER_DEVICE", "cpu")
@@ -182,10 +435,9 @@ class JobManager:
                 compute_type=compute,
             )
 
-        lang = None if language.lower() in ("auto", "") else language
         segments, info = self._whisper.transcribe(
             str(audio),
-            language=lang,
+            language=lang_code,
             vad_filter=True,
         )
 
@@ -238,6 +490,26 @@ class HybridTTS:
             {"id": "gtts_en", "name": "Google AI Voice (English)", "languages": ["en"], "category": "Google AI"},
             {"id": "gtts_zh", "name": "Google AI Voice (Chinese)", "languages": ["zh"], "category": "Google AI"},
         ]
+
+        # 4. OpenAI Neural Cloud Voices (Khi có OpenAI API Key)
+        if os.getenv("OPENAI_API_KEY", "").strip():
+            voices.extend([
+                {"id": "openai:alloy", "name": "🤖 Alloy (OpenAI Cloud - Tự Nhiên & Đa Năng)", "languages": ["vi", "en", "zh", "ja", "ko"], "category": "OpenAI Cloud"},
+                {"id": "openai:nova", "name": "🤖 Nova (OpenAI Cloud - Nữ Trẻ Trung & Tươi Tắn)", "languages": ["vi", "en", "zh", "ja", "ko"], "category": "OpenAI Cloud"},
+                {"id": "openai:shimmer", "name": "🤖 Shimmer (OpenAI Cloud - Nữ Ngọt Ngào & Trong Sáng)", "languages": ["vi", "en", "zh", "ja", "ko"], "category": "OpenAI Cloud"},
+                {"id": "openai:echo", "name": "🤖 Echo (OpenAI Cloud - Nam Ấm Áp & Truyền Cảm)", "languages": ["vi", "en", "zh", "ja", "ko"], "category": "OpenAI Cloud"},
+                {"id": "openai:onyx", "name": "🤖 Onyx (OpenAI Cloud - Nam Trầm Hùng & Cuốn Hút)", "languages": ["vi", "en", "zh", "ja", "ko"], "category": "OpenAI Cloud"},
+                {"id": "openai:fable", "name": "🤖 Fable (OpenAI Cloud - Kể Chuyện Sinh Động)", "languages": ["vi", "en", "zh", "ja", "ko"], "category": "OpenAI Cloud"},
+            ])
+
+        # 5. ElevenLabs AI Voices (Khi có ElevenLabs API Key)
+        if os.getenv("ELEVENLABS_API_KEY", "").strip():
+            voices.extend([
+                {"id": "elevenlabs:21m00Tcm4TlvDq8ikWAM", "name": "🎙️ Rachel (ElevenLabs - Nữ Siêu Thực)", "languages": ["vi", "en"], "category": "ElevenLabs AI"},
+                {"id": "elevenlabs:pNInz6obpgDQGcFmaJgB", "name": "🎙️ Adam (ElevenLabs - Nam Thuyết Minh)", "languages": ["vi", "en"], "category": "ElevenLabs AI"},
+                {"id": "elevenlabs:EXAVITQu4vr4xnSDxMaL", "name": "🎙️ Bella (ElevenLabs - Nữ Dịu Dàng)", "languages": ["vi", "en"], "category": "ElevenLabs AI"},
+                {"id": "elevenlabs:ErXwobaYiN019PkySvjV", "name": "🎙️ Antoni (ElevenLabs - Nam Trầm)", "languages": ["vi", "en"], "category": "ElevenLabs AI"},
+            ])
 
         with self.engine_lock:
             try:
@@ -308,8 +580,46 @@ class HybridTTS:
             seg_out = temp_dir / f"seg_{idx}.wav"
             success = False
 
-            # Option A: VieNeu-TTS
-            if tts_vieneu and target_voice.startswith("vieneu:"):
+            # Option A: OpenAI Cloud TTS
+            if not success and target_voice.startswith("openai:"):
+                openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+                if openai_key:
+                    try:
+                        voice_name = target_voice.split(":", 1)[1]
+                        res = requests.post(
+                            "https://api.openai.com/v1/audio/speech",
+                            headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
+                            json={"model": "tts-1", "voice": voice_name, "input": text},
+                            timeout=25,
+                        )
+                        if res.status_code == 200:
+                            seg_out.write_bytes(res.content)
+                            if seg_out.exists() and seg_out.stat().st_size > 100:
+                                success = True
+                    except Exception as e:
+                        print(f"OpenAI TTS error seg {idx}: {e}")
+
+            # Option B: ElevenLabs Cloud TTS
+            if not success and target_voice.startswith("elevenlabs:"):
+                eleven_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+                if eleven_key:
+                    try:
+                        voice_id_param = target_voice.split(":", 1)[1]
+                        res = requests.post(
+                            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id_param}",
+                            headers={"xi-api-key": eleven_key, "Content-Type": "application/json"},
+                            json={"text": text, "model_id": "eleven_multilingual_v2"},
+                            timeout=30,
+                        )
+                        if res.status_code == 200:
+                            seg_out.write_bytes(res.content)
+                            if seg_out.exists() and seg_out.stat().st_size > 100:
+                                success = True
+                    except Exception as e:
+                        print(f"ElevenLabs TTS error seg {idx}: {e}")
+
+            # Option C: VieNeu-TTS
+            if not success and tts_vieneu and target_voice.startswith("vieneu:"):
                 try:
                     voice_choice = target_voice.split(":", 1)[1]
                     if voice_choice == "ngoc_huyen" and ref_audio and ref_audio.exists():
@@ -322,7 +632,7 @@ class HybridTTS:
                 except Exception as e:
                     print(f"Vieneu seg {idx} error: {e}")
 
-            # Option B: Microsoft Edge-TTS
+            # Option D: Microsoft Edge-TTS
             if not success and (target_voice.startswith("vi-VN-") or target_voice.startswith("en-US-") or target_voice.startswith("zh-CN-") or target_voice.startswith("ja-JP-") or target_voice.startswith("ko-KR-")):
                 try:
                     async def _gen_edge():
@@ -334,7 +644,7 @@ class HybridTTS:
                 except Exception as e:
                     print(f"Edge seg {idx} error: {e}")
 
-            # Option C: Local OS SAPI5 (pyttsx3)
+            # Option E: Local OS SAPI5 (pyttsx3)
             if not success and (target_voice.startswith("HKEY_") or "TTS_MS_" in target_voice):
                 with self.engine_lock:
                     try:
@@ -349,7 +659,7 @@ class HybridTTS:
                     except Exception as e:
                         print(f"pyttsx3 seg {idx} error: {e}")
 
-            # Option D: Google AI Voice (gTTS fallback)
+            # Option F: Google AI Voice (gTTS fallback)
             if not success:
                 try:
                     lang = normalize_lang_code(target_language)
@@ -395,74 +705,329 @@ class HybridTTS:
             raise RuntimeError("TTS engine failed to create synchronized audio track")
 
 
-def extract_douyin_video_id(url: str) -> str | None:
-    m = re.search(r'modal_id=(\d+)', url)
+def extract_douyin_video_id(raw_text: str) -> str | None:
+    if not raw_text:
+        return None
+    raw_text = str(raw_text).strip()
+
+    # Check if raw text is already numeric ID
+    if re.fullmatch(r"\d{17,22}", raw_text):
+        return raw_text
+
+    # Extract any URL embedded in the text
+    urls = re.findall(r"https?://[^\s<>\"']+", raw_text)
+    target = urls[0] if urls else raw_text
+
+    # Regex matches on modal_id or /video/ or share or note
+    m = re.search(r"modal_id=(\d{17,22})", target)
     if m:
         return m.group(1)
-    m = re.search(r'/(?:video|share/video|modal)/(\d+)', url)
+    m = re.search(r"/(?:video|share/video|modal|note)/(\d{17,22})", target)
     if m:
         return m.group(1)
-    m = re.search(r'(\d{18,20})', url)
+    m = re.search(r"\b(\d{18,21})\b", target)
     if m:
         return m.group(1)
+
+    # If it's a short URL (e.g. v.douyin.com), follow redirects
+    if "douyin" in target or "iesdouyin" in target:
+        try:
+            headers_mobile = {
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+            }
+            resp = requests.get(target, headers=headers_mobile, allow_redirects=True, timeout=10)
+            final_url = resp.url
+            m = re.search(r"modal_id=(\d{17,22})", final_url)
+            if m:
+                return m.group(1)
+            m = re.search(r"/(?:video|share/video|modal|note)/(\d{17,22})", final_url)
+            if m:
+                return m.group(1)
+            m = re.search(r"(\d{18,21})", final_url)
+            if m:
+                return m.group(1)
+        except Exception as e:
+            print(f"Error following Douyin redirect: {e}")
+
     return None
 
 
-def download_douyin(url: str, work: Path) -> Path:
-    session = requests.Session()
-    headers_mobile = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-        "Referer": "https://www.iesdouyin.com/",
+def generate_douyin_random_token(length: int = 128) -> str:
+    import random
+    import string
+    chars = string.ascii_letters + string.digits + "_-"
+    return "".join(random.choices(chars, k=length))
+
+
+def find_existing_cookie_file(work_dir: Path | None = None) -> Path | None:
+    candidate_paths = [
+        Path("cookies.txt"),
+        BASE_DIR / "cookies.txt",
+        BASE_DIR.parent / "cookies.txt",
+        Path.home() / ".douyin_cookies.txt",
+        Path.home() / "cookies.txt",
+    ]
+    if work_dir:
+        candidate_paths.insert(0, work_dir / "cookies.txt")
+        candidate_paths.insert(1, work_dir.parent / "cookies.txt")
+
+    for p in candidate_paths:
+        try:
+            if p.exists() and p.is_file() and p.stat().st_size > 10:
+                return p
+        except Exception:
+            pass
+    return None
+
+
+def get_douyin_cookies_dict(session: requests.Session | None = None) -> dict[str, str]:
+    import random
+    import string
+    s = session or requests.Session()
+    headers_browser = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Referer": "https://www.douyin.com/",
+    }
+    cookies: dict[str, str] = {
+        "msToken": generate_douyin_random_token(128) + "=",
+        "odin_tt": "".join(random.choices(string.hexdigits.lower(), k=64)),
+        "passport_csrf_token": "".join(random.choices(string.hexdigits.lower(), k=32)),
+        "__ac_nonce": "".join(random.choices("0123456789abcdef", k=21)),
     }
 
+    # Strategy 1: ByteDance official register API
+    try:
+        register_url = "https://ttwid.bytedance.com/ttwid/union/register/"
+        payload = {
+            "region": "cn",
+            "aid": 1768,
+            "needFid": "0",
+            "service": "www.ixigua.com",
+            "migrate_info": {"ticket": "", "source": "node"},
+            "cbUrlProtocol": "https",
+            "union": True,
+        }
+        res = s.post(
+            register_url,
+            json=payload,
+            headers={"Content-Type": "application/json", **headers_browser},
+            timeout=5,
+        )
+        if res.cookies.get("ttwid"):
+            cookies["ttwid"] = res.cookies.get("ttwid")
+        else:
+            set_cookie = res.headers.get("Set-Cookie", "")
+            m = re.search(r"ttwid=([^;]+)", set_cookie)
+            if m:
+                cookies["ttwid"] = m.group(1)
+    except Exception:
+        pass
+
+    # Strategy 2: live.douyin.com
+    if "ttwid" not in cookies:
+        try:
+            res = s.get("https://live.douyin.com/", headers=headers_browser, timeout=5)
+            if res.cookies.get("ttwid"):
+                cookies["ttwid"] = res.cookies.get("ttwid")
+        except Exception:
+            pass
+
+    # Strategy 3: douyin.com
+    if "ttwid" not in cookies:
+        try:
+            res = s.get("https://www.douyin.com/", headers=headers_browser, timeout=5)
+            if res.cookies.get("ttwid"):
+                cookies["ttwid"] = res.cookies.get("ttwid")
+        except Exception:
+            pass
+
+    return cookies
+
+
+def write_netscape_cookie_file(cookies: dict[str, str], filepath: Path) -> Path:
+    lines = ["# Netscape HTTP Cookie File", "# https://curl.haxx.se/rfc/cookie_spec.html"]
+    for k, v in cookies.items():
+        lines.append(f".douyin.com\tTRUE\t/\tFALSE\t2147483647\t{k}\t{v}")
+    filepath.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return filepath
+
+
+def download_douyin(url: str, work: Path) -> Path:
+    work.mkdir(parents=True, exist_ok=True)
     video_id = extract_douyin_video_id(url)
     if not video_id:
-        resp = session.get(url, headers=headers_mobile, allow_redirects=True, timeout=10)
-        video_id = extract_douyin_video_id(resp.url)
+        raise RuntimeError(f"Could not extract Douyin video ID from: {url}")
 
-    if not video_id:
-        raise RuntimeError(f"Could not extract Douyin video ID from URL: {url}")
+    session = requests.Session()
+    cookies = get_douyin_cookies_dict(session)
+    for k, v in cookies.items():
+        session.cookies.set(k, v, domain=".douyin.com")
 
-    share_url = f"https://www.iesdouyin.com/share/video/{video_id}/"
-    session.get(share_url, headers=headers_mobile, timeout=10)
-    ttwid = session.cookies.get("ttwid", "")
+    # Load custom cookies if available
+    custom_cookie_file = find_existing_cookie_file(work)
+    if custom_cookie_file:
+        try:
+            with open(custom_cookie_file, "r", encoding="utf-8", errors="ignore") as cf:
+                for line in cf:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        parts = line.split("\t")
+                        if len(parts) >= 7:
+                            c_domain, _, _, _, _, c_name, c_val = parts[:7]
+                            session.cookies.set(c_name, c_val, domain=c_domain)
+        except Exception as e:
+            print(f"Notice: Failed to parse custom cookie file: {e}")
 
-    headers_pc = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://www.douyin.com/",
-        "Cookie": f"ttwid={ttwid}",
+    cookie_header_str = "; ".join(f"{k}={v}" for k, v in session.cookies.get_dict().items())
+    if "ttwid" in cookies and "ttwid" not in session.cookies.get_dict():
+        cookie_header_str += f"; ttwid={cookies['ttwid']}"
+
+    headers_browser = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Referer": f"https://www.douyin.com/video/{video_id}",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Cookie": cookie_header_str,
     }
-    detail_url = f"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id={video_id}"
-    r_detail = requests.get(detail_url, headers=headers_pc, timeout=10)
-    data = r_detail.json()
-    aweme = data.get("aweme_detail", {})
-    play_addr = aweme.get("video", {}).get("play_addr", {})
-    url_list = play_addr.get("url_list", [])
+
+    url_list: list[str] = []
+
+    # Step 1: Query Douyin official web endpoints with multiple aid signatures
+    detail_endpoints = [
+        f"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id={video_id}&aid=6383&device_platform=webapp&version_code=170400&version_name=17.4.0",
+        f"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id={video_id}&aid=1128&version_name=23.5.0&device_platform=android&os_version=2333",
+        f"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id={video_id}",
+        f"https://www.iesdouyin.com/aweme/v1/web/aweme/detail/?aweme_id={video_id}",
+    ]
+
+    for endpoint in detail_endpoints:
+        try:
+            r_detail = session.get(endpoint, headers=headers_browser, timeout=12)
+            if r_detail.status_code == 200:
+                data = r_detail.json()
+                aweme = data.get("aweme_detail") or {}
+                video = aweme.get("video") or {}
+
+                # 1. High quality bitrates sorted descending
+                bit_rates = video.get("bit_rate") or []
+                try:
+                    bit_rates_sorted = sorted(bit_rates, key=lambda b: int(b.get("bit_rate", 0)), reverse=True)
+                except Exception:
+                    bit_rates_sorted = bit_rates
+                for br in bit_rates_sorted:
+                    br_urls = (br.get("play_addr") or {}).get("url_list") or []
+                    for u in br_urls:
+                        if u and u.startswith("http") and u not in url_list:
+                            url_list.append(u)
+
+                # 2. H.264 high-compatibility stream
+                h264_urls = (video.get("play_addr_h264") or {}).get("url_list") or []
+                for u in h264_urls:
+                    if u and u.startswith("http") and u not in url_list:
+                        url_list.append(u)
+
+                # 3. Standard play_addr
+                play_urls = (video.get("play_addr") or {}).get("url_list") or []
+                for u in play_urls:
+                    if u and u.startswith("http") and u not in url_list:
+                        url_list.append(u)
+
+                # 4. Download addr
+                dl_urls = (video.get("download_addr") or {}).get("url_list") or []
+                for u in dl_urls:
+                    if u and u.startswith("http") and u not in url_list:
+                        url_list.append(u)
+
+                # 5. URI direct endpoint fallback
+                vid_uri = video.get("uri")
+                if vid_uri:
+                    url_list.append(f"https://aweme.snssdk.com/aweme/v1/play/?video_id={vid_uri}&ratio=1080p&line=0")
+                    url_list.append(f"https://api-hl.amemv.com/aweme/v1/play/?video_id={vid_uri}&ratio=1080p&line=0")
+
+                if url_list:
+                    break
+        except Exception as e:
+            print(f"Douyin detail API endpoint error ({endpoint}): {e}")
+
+    # Step 2: Fallback Mobile endpoint if detail API returned nothing
+    if not url_list:
+        headers_mobile = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+            "Referer": "https://www.iesdouyin.com/",
+        }
+        for direct_play in [
+            f"https://aweme.snssdk.com/aweme/v1/play/?video_id={video_id}&ratio=1080p&line=0",
+            f"https://api-hl.amemv.com/aweme/v1/play/?video_id={video_id}&ratio=1080p&line=0",
+        ]:
+            try:
+                r_direct = session.get(direct_play, headers=headers_mobile, allow_redirects=False, timeout=8)
+                if r_direct.status_code in (301, 302) and "location" in r_direct.headers:
+                    url_list.append(r_direct.headers["location"])
+            except Exception:
+                pass
 
     if not url_list:
-        raise RuntimeError("No downloadable video stream URL found for this Douyin video")
+        raise RuntimeError(f"No downloadable stream found for Douyin video {video_id}")
 
-    download_url = url_list[0]
+    # Step 3: Stream download to work directory with retries
     out_file = work / "source.mp4"
-    with requests.get(download_url, headers=headers_pc, stream=True, timeout=30) as r:
-        r.raise_for_status()
-        with open(out_file, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
+    download_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Referer": "https://www.douyin.com/",
+        "Accept": "*/*",
+    }
 
-    if not out_file.exists() or out_file.stat().st_size == 0:
-        raise RuntimeError("Failed to download Douyin video file")
+    downloaded = False
+    for candidate_url in url_list:
+        try:
+            with session.get(candidate_url, headers=download_headers, stream=True, timeout=30) as r:
+                if r.status_code in (200, 206):
+                    with open(out_file, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                f.write(chunk)
+                    if out_file.exists() and out_file.stat().st_size > 10000:
+                        downloaded = True
+                        break
+        except Exception as e:
+            print(f"Douyin candidate download glitch ({e}), trying next stream URL...")
+
+    if not downloaded or not out_file.exists() or out_file.stat().st_size < 10000:
+        raise RuntimeError(f"Failed to download complete video stream for Douyin video {video_id}")
 
     return out_file
 
 
 def download_video(url: str, work: Path) -> Path:
-    if "douyin.com" in url or "iesdouyin.com" in url:
+    work.mkdir(parents=True, exist_ok=True)
+    url_clean = str(url).strip().strip('"').strip("'")
+
+    # 0. Local file check
+    if Path(url_clean).exists() and Path(url_clean).is_file():
+        dest = work / f"source{Path(url_clean).suffix}"
+        if Path(url_clean).resolve() != dest.resolve():
+            shutil.copy2(url_clean, dest)
+        return dest
+
+    # 1. Douyin handler
+    video_id = extract_douyin_video_id(url_clean)
+    is_douyin = (
+        "douyin" in url_clean.lower()
+        or "iesdouyin" in url_clean.lower()
+        or (url_clean.isdigit() and len(url_clean) >= 17)
+        or (video_id is not None and ("douyin" in url_clean.lower() or "modal_id=" in url_clean.lower() or url_clean.isdigit()))
+    )
+
+    if is_douyin or video_id:
         try:
-            return download_douyin(url, work)
+            return download_douyin(url_clean, work)
         except Exception as e:
-            print(f"Direct Douyin download failed ({e}), trying yt-dlp fallback...")
+            print(f"Direct Douyin download failed ({e}), trying yt-dlp with Netscape cookiefile fallback...")
+
+    # 2. General yt-dlp handler
+    yt_url = url_clean
+    if video_id and ("douyin" in url_clean.lower() or url_clean.isdigit() or "modal_id=" in url_clean.lower()):
+        yt_url = f"https://www.douyin.com/video/{video_id}"
 
     output_template = str(work / "source.%(ext)s")
     options = {
@@ -473,19 +1038,37 @@ def download_video(url: str, work: Path) -> Path:
         "quiet": True,
     }
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-        requested = Path(ydl.prepare_filename(info))
-        mp4 = requested.with_suffix(".mp4")
-        if mp4.exists():
-            return mp4
-        if requested.exists():
-            return requested
+    # Setup Netscape cookie file for yt-dlp to avoid "Passing cookies as a header is a potential security risk"
+    cookie_file = find_existing_cookie_file(work)
+    temp_cookie_path = None
+    if cookie_file:
+        options["cookiefile"] = str(cookie_file)
+    elif is_douyin or video_id:
+        try:
+            dy_cookies = get_douyin_cookies_dict()
+            temp_cookie_path = work / ".yt_dlp_cookies.txt"
+            write_netscape_cookie_file(dy_cookies, temp_cookie_path)
+            options["cookiefile"] = str(temp_cookie_path)
+        except Exception as e:
+            print(f"Notice: Failed to create temporary cookie file for yt-dlp: {e}")
 
-        candidates = list(work.glob("source.*"))
-        if not candidates:
-            raise RuntimeError("Downloaded video was not found")
-        return candidates[0]
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(yt_url, download=True)
+            requested = Path(ydl.prepare_filename(info))
+            mp4 = requested.with_suffix(".mp4")
+            if mp4.exists():
+                return mp4
+            if requested.exists():
+                return requested
+
+            candidates = list(work.glob("source.*"))
+            if not candidates:
+                raise RuntimeError("Downloaded video was not found")
+            return candidates[0]
+    finally:
+        if temp_cookie_path and temp_cookie_path.exists():
+            temp_cookie_path.unlink(missing_ok=True)
 
 
 def ffmpeg_extract_audio(video: Path, audio: Path):
@@ -504,44 +1087,260 @@ def ffmpeg_extract_audio(video: Path, audio: Path):
     )
 
 
-def mix_audio(video: Path, speech: Path, output: Path):
-    filter_complex = (
-        "[0:a]volume=0.15[bg];"
-        "[1:a]volume=1.0[voice];"
-        "[bg][voice]amix=inputs=2:duration=first:dropout_transition=2[mix]"
-    )
+def get_video_dimensions(file_path: Path) -> tuple[int, int]:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=s=x:p=0",
+        str(file_path),
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0 and "x" in res.stdout.strip():
+            parts = res.stdout.strip().split("x")
+            return int(parts[0]), int(parts[1])
+    except Exception:
+        pass
+    return 1080, 1920
 
-    run_ffmpeg(
-        [
-            "-y",
-            "-i",
-            str(video),
-            "-i",
-            str(speech),
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "0:v:0",
-            "-map",
-            "[mix]",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-shortest",
-            str(output),
-        ]
-    )
+
+def check_has_audio(file_path: Path) -> bool:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(file_path),
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        return res.returncode == 0 and bool(res.stdout.strip())
+    except Exception:
+        return True
+
+
+def format_ass_time(seconds: float) -> str:
+    total_cs = int(round(max(0.0, float(seconds)) * 100))
+    cs = total_cs % 100
+    total_s = total_cs // 100
+    s = total_s % 60
+    total_m = total_s // 60
+    m = total_m % 60
+    h = total_m // 60
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def generate_ass(
+    segments: list[dict],
+    out_path: Path,
+    style_type: str = "yellow",
+    video_path: Path | None = None,
+):
+    width, height = (1080, 1920)
+    if video_path and video_path.exists():
+        width, height = get_video_dimensions(video_path)
+
+    # Adaptive font size and margin according to aspect ratio and resolution
+    if height > width:  # Vertical video (9:16 - Douyin / TikTok / Reels)
+        fontsize = max(24, int(width * 0.046))
+        margin_v = int(height * 0.10)  # Position centered inside the cleaned hardsub area
+        margin_lr = int(width * 0.05)
+    else:  # Horizontal video (16:9 - YouTube / Facebook)
+        fontsize = max(22, int(height * 0.052))
+        margin_v = int(height * 0.075)
+        margin_lr = int(width * 0.04)
+
+    # ASS Styles:
+    # Yellow font: &H0000FFFF (ABGR format -> 00 FFFF is Yellow)
+    # White font: &H00FFFFFF
+    # Black Outline: &H00000000
+    # Shadow: &H80000000
+    if style_type in ("yellow", "blur_yellow", "outline", "outline_yellow"):
+        # Vibrant Yellow with thick black border and soft shadow
+        style_line = (
+            f"Style: Default,Arial,{fontsize},&H0000FFFF,&H000000FF,&H00000000,&H80000000,"
+            f"-1,0,0,0,100,100,0,0,1,3.5,2,2,{margin_lr},{margin_lr},{margin_v},1"
+        )
+    elif style_type in ("white", "blur_white", "mask_white", "outline_white", "white_outline"):
+        # Crisp White with thick black border and soft shadow
+        style_line = (
+            f"Style: Default,Arial,{fontsize},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
+            f"-1,0,0,0,100,100,0,0,1,3.5,2,2,{margin_lr},{margin_lr},{margin_v},1"
+        )
+    elif style_type == "box":
+        # Crisp White text inside an elegant dark translucent box (&HA0000000)
+        box_padding = max(4, int(fontsize * 0.18))
+        style_line = (
+            f"Style: Default,Arial,{fontsize},&H00FFFFFF,&H000000FF,&H00000000,&HA0000000,"
+            f"-1,0,0,0,100,100,0,0,3,{box_padding},0,2,{margin_lr},{margin_lr},{margin_v},1"
+        )
+    else:
+        # Default yellow
+        style_line = (
+            f"Style: Default,Arial,{fontsize},&H0000FFFF,&H000000FF,&H00000000,&H80000000,"
+            f"-1,0,0,0,100,100,0,0,1,3.5,2,2,{margin_lr},{margin_lr},{margin_v},1"
+        )
+
+    lines = [
+        "[Script Info]",
+        "Title: Vietnamese Subtitles",
+        "ScriptType: v4.00+",
+        "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes",
+        "YCbCr Matrix: TV.601",
+        f"PlayResX: {width}",
+        f"PlayResY: {height}",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        style_line,
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+    for seg in segments:
+        text = str(seg.get("text", "")).strip()
+        if not text:
+            continue
+        start = format_ass_time(seg.get("start", 0))
+        end = format_ass_time(seg.get("end", 0))
+        clean_text = text.replace("\r", "").replace("\n", "\\N")
+        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{clean_text}")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def mix_audio(
+    video: Path,
+    speech: Path,
+    output: Path,
+    subtitle_file: Path | None = None,
+    clean_sub_mode: str = "blur",
+):
+    has_audio = check_has_audio(video)
+    width, height = get_video_dimensions(video)
+
+    # Calculate bounding box coordinates for hardsub removal
+    if height > width:  # Vertical video (9:16)
+        w_box = int(width * 0.94)
+        h_box = int(height * 0.13)
+        x_box = int((width - w_box) / 2)
+        y_box = int(height * 0.77)
+    else:  # Horizontal video (16:9)
+        w_box = int(width * 0.90)
+        h_box = int(height * 0.13)
+        x_box = int((width - w_box) / 2)
+        y_box = int(height * 0.81)
+
+    # Ensure even integers for FFmpeg filters
+    w_box = (w_box // 2) * 2
+    h_box = (h_box // 2) * 2
+    x_box = (x_box // 2) * 2
+    y_box = (y_box // 2) * 2
+
+    # Step 1: Video filtering (Clean hardsub + Subtitle burn-in)
+    filter_complex_parts = []
+    has_video_filter = False
+    v_target = "0:v:0"
+
+    if clean_sub_mode == "blur":
+        filter_complex_parts.append(
+            f"[0:v]split[v_base][v_crop];"
+            f"[v_crop]crop={w_box}:{h_box}:{x_box}:{y_box},avgblur=sizeX=25:sizeY=25[v_blur];"
+            f"[v_base][v_blur]overlay={x_box}:{y_box}[v_clean]"
+        )
+        v_target = "[v_clean]"
+        has_video_filter = True
+    elif clean_sub_mode == "mask":
+        filter_complex_parts.append(
+            f"[0:v]drawbox=x={x_box}:y={y_box}:w={w_box}:h={h_box}:color=black@0.75:t=fill[v_clean]"
+        )
+        v_target = "[v_clean]"
+        has_video_filter = True
+
+    if subtitle_file and subtitle_file.exists():
+        escaped_sub = str(subtitle_file.resolve()).replace("\\", "/").replace(":", "\\:")
+        if has_video_filter:
+            filter_complex_parts.append(f"{v_target}ass=filename='{escaped_sub}'[v_out]")
+        else:
+            filter_complex_parts.append(f"[0:v]ass=filename='{escaped_sub}'[v_out]")
+        v_target = "[v_out]"
+        has_video_filter = True
+    elif has_video_filter:
+        filter_complex_parts.append(f"{v_target}null[v_out]")
+        v_target = "[v_out]"
+
+    # Step 2: Audio mixing
+    if has_audio:
+        filter_complex_parts.append(
+            "[0:a]volume=0.15[bg];"
+            "[1:a]volume=1.0[voice];"
+            "[bg][voice]amix=inputs=2:duration=first:dropout_transition=2[a_out]"
+        )
+        a_target = "[a_out]"
+    else:
+        filter_complex_parts.append("[1:a]volume=1.0[a_out]")
+        a_target = "[a_out]"
+
+    full_filter = ";".join(filter_complex_parts)
+
+    args = [
+        "-y",
+        "-i", str(video),
+        "-i", str(speech),
+        "-filter_complex", full_filter,
+        "-map", v_target,
+        "-map", a_target,
+    ]
+
+    if has_video_filter:
+        args.extend([
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "20",
+        ])
+    else:
+        args.extend([
+            "-c:v", "copy",
+        ])
+
+    args.extend([
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-sn",  # Drop all existing soft subtitle tracks
+        "-shortest",
+        str(output),
+    ])
+
+    run_ffmpeg(args)
 
 
 def run_ffmpeg(args: list[str]):
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("FFmpeg was not found on PATH")
 
+    cmd = ["ffmpeg"]
+    if "-nostdin" not in args:
+        cmd.append("-nostdin")
+    cmd.extend(args)
+
     process = subprocess.run(
-        ["ffmpeg", *args],
+        cmd,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
     )
     if process.returncode != 0:
         raise RuntimeError(process.stderr[-4000:])
@@ -564,11 +1363,129 @@ def generate_srt(segments: list[dict], out_path: Path):
     out_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def translate_with_gemini(texts: list[str], source_lang: str, target_lang: str) -> list[str] | None:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    
+    prompt = (
+        f"You are an expert video dubbing and subtitling translator. "
+        f"Translate the following list of subtitle sentences from {source_lang} into {target_lang}. "
+        f"Requirements:\n"
+        f"1. Make the translation sound completely natural, engaging, and suitable for spoken video dubbing.\n"
+        f"2. Keep the sentence length concise so it fits video timing.\n"
+        f"3. Return ONLY a valid JSON object in this exact format: {{\"translations\": [\"translated line 1\", \"translated line 2\", ...]}}.\n"
+        f"4. The output array MUST contain exactly {len(texts)} elements corresponding 1:1 to the input array.\n\n"
+        f"Input sentences array:\n{json.dumps(texts, ensure_ascii=False)}"
+    )
+
+    models_to_try = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
+    for model_name in models_to_try:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "temperature": 0.3,
+                },
+            }
+            resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
+            if resp.status_code == 200:
+                res_json = resp.json()
+                text_out = res_json["candidates"][0]["content"]["parts"][0]["text"]
+                parsed = json.loads(text_out)
+                translations = parsed.get("translations") if isinstance(parsed, dict) else parsed
+                if isinstance(translations, list) and len(translations) == len(texts):
+                    print(f"[Speedup] Google Gemini {model_name} translated {len(texts)} subtitle segments in ~1s!")
+                    return [str(t).strip() for t in translations]
+                elif isinstance(translations, list) and len(translations) > 0:
+                    while len(translations) < len(texts):
+                        translations.append(texts[len(translations)])
+                    return [str(t).strip() for t in translations[:len(texts)]]
+            else:
+                print(f"Gemini {model_name} notice ({resp.status_code}): {resp.text[:200]}")
+        except Exception as e:
+            print(f"Gemini {model_name} exception: {e}")
+    return None
+
+
+def translate_with_groq(texts: list[str], source_lang: str, target_lang: str) -> list[str] | None:
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        return None
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    
+    prompt = (
+        f"Translate the following array of {len(texts)} subtitle sentences from {source_lang} to {target_lang} for video dubbing. "
+        f"Output ONLY valid JSON with key 'translations' containing an array of exactly {len(texts)} translated strings."
+    )
+    
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": json.dumps({"texts": texts}, ensure_ascii=False)},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2,
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=20)
+        if resp.status_code == 200:
+            content = resp.json()["choices"][0]["message"]["content"]
+            parsed = json.loads(content)
+            translations = parsed.get("translations") if isinstance(parsed, dict) else parsed
+            if isinstance(translations, list):
+                while len(translations) < len(texts):
+                    translations.append(texts[len(translations)])
+                print(f"[Speedup] Groq Llama 3.3 translated {len(texts)} segments in sub-second!")
+                return [str(t).strip() for t in translations[:len(texts)]]
+    except Exception as e:
+        print(f"Groq translation error: {e}")
+    return None
+
+
+def translate_with_openai(texts: list[str], source_lang: str, target_lang: str) -> list[str] | None:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": f"You are a professional video dubbing translator. Translate {len(texts)} sentences from {source_lang} to {target_lang}. Return ONLY a JSON object: {{\"translations\": [\"...\"]}}."},
+            {"role": "user", "content": json.dumps({"texts": texts}, ensure_ascii=False)},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.3,
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=25)
+        if resp.status_code == 200:
+            content = resp.json()["choices"][0]["message"]["content"]
+            parsed = json.loads(content)
+            translations = parsed.get("translations") if isinstance(parsed, dict) else parsed
+            if isinstance(translations, list):
+                while len(translations) < len(texts):
+                    translations.append(texts[len(translations)])
+                print(f"[Speedup] OpenAI GPT-4o-mini translated {len(texts)} segments!")
+                return [str(t).strip() for t in translations[:len(texts)]]
+    except Exception as e:
+        print(f"OpenAI translation error: {e}")
+    return None
+
+
 def translate_segments(
     transcript: dict,
     source_language: str,
     target_language: str,
 ) -> dict:
+    import time
+
     src = normalize_lang_code(source_language)
     tgt = normalize_lang_code(target_language) if target_language else "vi"
 
@@ -577,30 +1494,80 @@ def translate_segments(
         return transcript
 
     texts = [seg.get("text", "").strip() for seg in segments]
-    combined_text = "\n###\n".join([t if t else "..." for t in texts])
+    trans_pref = os.getenv("TRANSLATE_PROVIDER", "auto").lower()
 
-    try:
-        translated_combined = GoogleTranslator(source=src, target=tgt).translate(combined_text)
-        translated_lines = [l.strip() for l in translated_combined.split("\n###\n")]
-        if len(translated_lines) != len(texts):
-            translated_lines = [l.strip() for l in translated_combined.split("\n") if l.strip()]
+    translated_lines: list[str] | None = None
 
-        translated_segments = []
-        for i, seg in enumerate(segments):
-            t_text = translated_lines[i] if i < len(translated_lines) else seg.get("text", "")
-            translated_segments.append({**seg, "text": t_text})
-        return {**transcript, "segments": translated_segments}
-    except Exception as e:
-        print(f"Batch translation fallback ({e})")
-        translated_segments = []
+    # 1. Google Gemini Flash (Tự nhiên nhất & Chuẩn ngữ cảnh)
+    if trans_pref == "gemini" or (trans_pref == "auto" and os.getenv("GEMINI_API_KEY")):
+        translated_lines = translate_with_gemini(texts, src, tgt)
+
+    # 2. Groq Llama 3.3 (Siêu tốc <1s)
+    if not translated_lines and (trans_pref == "groq" or (trans_pref == "auto" and os.getenv("GROQ_API_KEY"))):
+        translated_lines = translate_with_groq(texts, src, tgt)
+
+    # 3. OpenAI GPT-4o-mini
+    if not translated_lines and (trans_pref == "openai" or (trans_pref == "auto" and os.getenv("OPENAI_API_KEY"))):
+        translated_lines = translate_with_openai(texts, src, tgt)
+
+    # 4. Fallback to GoogleTranslator (Batch processing)
+    if not translated_lines:
+        batches: list[list[str]] = []
+        current_batch: list[str] = []
+        current_length = 0
+
+        for text in texts:
+            t = text if text else "..."
+            item_len = len(t) + 5
+            if current_length + item_len > 1500 and current_batch:
+                batches.append(current_batch)
+                current_batch = [t]
+                current_length = len(t)
+            else:
+                current_batch.append(t)
+                current_length += item_len
+
+        if current_batch:
+            batches.append(current_batch)
+
+        translated_lines = []
         translator = GoogleTranslator(source=src, target=tgt)
-        for seg in segments:
-            txt = seg.get("text", "").strip()
-            if not txt:
-                translated_segments.append(seg)
-                continue
-            try:
-                translated_segments.append({**seg, "text": translator.translate(txt)})
-            except Exception:
-                translated_segments.append(seg)
-        return {**transcript, "segments": translated_segments}
+
+        def safe_translate(text: str, retries: int = 3) -> str | None:
+            for attempt in range(retries):
+                try:
+                    res = translator.translate(text)
+                    if res:
+                        return res
+                except Exception:
+                    time.sleep(1.0 * (attempt + 1))
+            return None
+
+        for batch in batches:
+            combined_text = "\n###\n".join(batch)
+            res = safe_translate(combined_text)
+            
+            if res:
+                parts = [p.strip() for p in res.split("\n###\n")]
+                if len(parts) == len(batch):
+                    translated_lines.extend(parts)
+                else:
+                    for single_text in batch:
+                        translated = safe_translate(single_text)
+                        translated_lines.append(translated if translated else single_text)
+                        time.sleep(0.2)
+            else:
+                print("Batch translate failed after retries, translating single items...")
+                for single_text in batch:
+                    translated = safe_translate(single_text)
+                    translated_lines.append(translated if translated else single_text)
+                    time.sleep(0.2)
+
+            time.sleep(0.5)
+
+    translated_segments = []
+    for i, seg in enumerate(segments):
+        t_text = translated_lines[i] if i < len(translated_lines) else seg.get("text", "")
+        translated_segments.append({**seg, "text": t_text})
+
+    return {**transcript, "segments": translated_segments}

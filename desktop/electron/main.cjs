@@ -1,19 +1,30 @@
-const { app, BrowserWindow } = require("electron");
+const { app, BrowserWindow, Menu } = require("electron");
 const path = require("path");
+const fs = require("fs");
 
 function createWindow() {
   const win = new BrowserWindow({
-    width: 1180,
-    height: 820,
+    width: 1200,
+    height: 840,
     minWidth: 980,
     minHeight: 700,
+    title: "AI Video Dubber & Dịch Thuật Tự Động",
+    backgroundColor: "#0b0f19",
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false
     }
   });
 
-  win.loadURL("http://127.0.0.1:5173");
+  // Tùy chọn ẩn menu mặc định để giao diện trông chuyên nghiệp
+  Menu.setApplicationMenu(null);
+
+  const distIndex = path.join(__dirname, "../dist/index.html");
+  if (fs.existsSync(distIndex)) {
+    win.loadFile(distIndex);
+  } else {
+    win.loadURL("http://127.0.0.1:5173");
+  }
 }
 
 app.whenReady().then(() => {
