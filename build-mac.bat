@@ -15,6 +15,6 @@ if exist "tools\python_embed\python.exe" (
 
 echo.
 echo ================================================================
-echo Hoan tat! File zip: AI-Video-Dubber-macOS.zip
+echo Hoan tat! Thu muc xuat ra: AI-Video-Dubber-macOS
 echo ================================================================
 pause

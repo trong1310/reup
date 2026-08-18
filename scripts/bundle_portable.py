@@ -110,9 +110,11 @@ def copy_electron_runtime():
 def copy_and_optimize_python():
     log("Đang đóng gói và tối ưu hóa Python Runtime...")
     src_python = ROOT_DIR / "tools" / "python_embed"
-    dest_python = APP_DIR / "python"
     if not src_python.exists():
-        raise RuntimeError("Chưa tìm thấy tools/python_embed!")
+        src_python = Path(sys.prefix)
+        log(f"Không tìm thấy tools/python_embed, tự động sử dụng Python hệ thống: {src_python}")
+    
+    dest_python = APP_DIR / "python"
 
     # Sao chép python
     if not dest_python.exists():
@@ -133,23 +135,24 @@ def copy_and_optimize_python():
         "sklearn", "scikit_learn-1.9.0.dist-info",
         "PyWin32.chm", "scipy-1.17.1-cp311-cp311-win_amd64.whl"
     ]
-    for pkg in unused_packages:
-        p = site_packages / pkg
-        if p.exists():
-            if p.is_dir():
-                shutil.rmtree(p, ignore_errors=True)
-            else:
-                p.unlink(missing_ok=True)
+    if site_packages.exists():
+        for pkg in unused_packages:
+            p = site_packages / pkg
+            if p.exists():
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    p.unlink(missing_ok=True)
 
-    # 2. Xóa các thư mục test suites lớn (trong torch, sympy, scipy, numpy, v.v.)
-    test_folders = ["**/tests", "**/test", "**/*_test", "**/doc", "**/docs"]
-    for pat in test_folders:
-        for t_dir in site_packages.glob(pat):
-            if t_dir.is_dir() and "vieneu" not in str(t_dir).lower() and "whisper" not in str(t_dir).lower():
-                try:
-                    shutil.rmtree(t_dir, ignore_errors=True)
-                except Exception:
-                    pass
+        # 2. Xóa các thư mục test suites lớn (trong torch, sympy, scipy, numpy, v.v.)
+        test_folders = ["**/tests", "**/test", "**/*_test", "**/doc", "**/docs"]
+        for pat in test_folders:
+            for t_dir in site_packages.glob(pat):
+                if t_dir.is_dir() and "vieneu" not in str(t_dir).lower() and "whisper" not in str(t_dir).lower():
+                    try:
+                        shutil.rmtree(t_dir, ignore_errors=True)
+                    except Exception:
+                        pass
 
     # 3. Xóa __pycache__ và *.pyc, *.pdb
     for pycache in dest_python.glob("**/__pycache__"):
@@ -172,11 +175,16 @@ def copy_ffmpeg():
     dest_ffmpeg = APP_DIR / "tools" / "ffmpeg"
     dest_ffmpeg.mkdir(parents=True, exist_ok=True)
     
+    found = False
     for exe in ["ffmpeg.exe", "ffprobe.exe"]:
         src_exe = src_ffmpeg / exe
         if src_exe.exists():
             shutil.copy2(src_exe, dest_ffmpeg / exe)
-    log("FFmpeg Portable đã được đóng gói.")
+            found = True
+    if found:
+        log("FFmpeg Portable đã được đóng gói.")
+    else:
+        log("Cảnh báo: Chưa tìm thấy tools/ffmpeg, ứng dụng sẽ dùng FFmpeg từ môi trường nếu có.")
 
 def copy_backend_code():
     log("Đang sao chép mã nguồn Backend AI...")

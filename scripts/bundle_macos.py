@@ -267,40 +267,57 @@ AI VIDEO DUBBER & DỊCH THUẬT TỰ ĐỘNG - PHIÊN BẢN MAC OS
 def create_zip_archive():
     zip_path = ROOT_DIR / "AI-Video-Dubber-macOS.zip"
     log(f"Đang nén toàn bộ thư mục thành file: {zip_path.name}...")
-    
+
     if zip_path.exists():
-        zip_path.unlink(missing_ok=True)
-        
+        try:
+            zip_path.unlink()
+        except Exception:
+            pass
+
+    tar_cmd = shutil.which("tar")
+    if tar_cmd:
+        try:
+            res = subprocess.run(
+                [tar_cmd, "-a", "-c", "-f", zip_path.name, OUTPUT_DIR.name],
+                cwd=str(ROOT_DIR),
+                capture_output=True,
+                text=True
+            )
+            if res.returncode == 0 and zip_path.exists():
+                size_mb = zip_path.stat().st_size / (1024 * 1024)
+                log(f"Nén file zip hoàn tất! Dung lượng: {size_mb:.2f} MB")
+                return
+        except Exception as e:
+            log(f"Cảnh báo: Lỗi tar ({e}), chuyển sang ZipFile...")
+
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for root, dirs, files in os.walk(OUTPUT_DIR):
             for file in files:
                 file_path = Path(root) / file
                 arcname = file_path.relative_to(ROOT_DIR)
-                
-                # Set executable permissions in zip for .command and .sh
                 zinfo = zipfile.ZipInfo.from_file(file_path, arcname=str(arcname))
                 if file.endswith((".command", ".sh")):
                     zinfo.external_attr = 0o755 << 16  # rwxr-xr-x permissions
-                zf.writestr(zinfo, file_path.read_bytes())
-                
-    size_mb = zip_path.stat().st_size / (1024 * 1024)
-    log(f"Nén file zip hoàn tất! Dung lượng: {size_mb:.2f} MB")
+                with open(file_path, "rb") as f:
+                    zf.writestr(zinfo, f.read())
+
+    if zip_path.exists():
+        size_mb = zip_path.stat().st_size / (1024 * 1024)
+        log(f"Nén file zip hoàn tất! Dung lượng: {size_mb:.2f} MB")
 
 def main():
     print("\n" + "="*65)
     print("      ĐÓNG GÓI BẢN PHÁT HÀNH DÀNH RIÊNG CHO MAC OS")
     print("="*65 + "\n")
-    
+
     ensure_frontend_built()
     setup_directory_structure()
     copy_macos_assets()
     create_macos_launchers()
-    create_zip_archive()
-    
+
     print("\n" + "="*65)
     print("      ĐÓNG GÓI CHO MAC OS HOÀN TẤT 100%!")
     print(f"      - Thư mục: {OUTPUT_DIR}")
-    print(f"      - File nén: {ROOT_DIR / 'AI-Video-Dubber-macOS.zip'}")
     print("="*65 + "\n")
 
 if __name__ == "__main__":

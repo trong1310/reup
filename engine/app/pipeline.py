@@ -274,6 +274,208 @@ class JobManager:
             req = job.get("request") if "job" in locals() and job else None
             log_error_to_file(err_msg, exc=exc, job_id=job_id, context=req)
 
+    async def run_product_job(self, job_id: str):
+        import random
+        import base64
+        try:
+            job = self.get(job_id)
+            req = job["request"]
+            work = self.data_dir / job_id
+            work.mkdir(parents=True, exist_ok=True)
+
+            self.update(job_id, status="running", stage="download_image", progress=10)
+
+            # Save base image and convert with PIL to ensure valid PNG format for FFmpeg
+            raw_img_path = work / "raw_product_img"
+            if req.get("product_image_base64"):
+                raw_b64 = req["product_image_base64"]
+                if "," in raw_b64:
+                    raw_b64 = raw_b64.split(",", 1)[1]
+                img_bytes = base64.b64decode(raw_b64)
+                raw_img_path.write_bytes(img_bytes)
+            elif req.get("product_image_url"):
+                img_url = req["product_image_url"].strip()
+                # Parse TikTok og_info param if available in url
+                import urllib.parse
+                parsed_url = urllib.parse.urlparse(img_url)
+                qs = urllib.parse.parse_qs(parsed_url.query)
+                extracted_img_url = None
+                if "og_info" in qs:
+                    try:
+                        og_data = json.loads(qs["og_info"][0])
+                        if "image" in og_data:
+                            extracted_img_url = og_data["image"]
+                        if "title" in og_data and not req.get("product_name"):
+                            req["product_name"] = og_data["title"]
+                    except Exception:
+                        pass
+                
+                target_url = extracted_img_url or img_url
+                if target_url.startswith("http"):
+                    try:
+                        resp = requests.get(target_url, timeout=15)
+                        if resp.status_code == 200:
+                            raw_img_path.write_bytes(resp.content)
+                    except Exception:
+                        pass
+
+            product_img_path = work / "product_source.png"
+            loaded_ok = False
+            if raw_img_path.exists() and raw_img_path.stat().st_size > 10:
+                try:
+                    from PIL import Image
+                    with Image.open(raw_img_path) as im:
+                        im.convert("RGB").save(product_img_path, "PNG")
+                        loaded_ok = True
+                except Exception:
+                    loaded_ok = False
+
+            if not loaded_ok or not product_img_path.exists():
+                # Create a fallback placeholder image with canvas gradient
+                from PIL import Image, ImageDraw
+                img = Image.new("RGB", (1080, 1920), color=(20, 20, 35))
+                draw = ImageDraw.Draw(img)
+                draw.rectangle([40, 40, 1040, 1880], outline=(139, 92, 246), width=10)
+                draw.text((300, 900), "PRODUCT SHOWCASE AI", fill=(255, 255, 255))
+                img.save(product_img_path, "PNG")
+
+            self.update(job_id, stage="generate_script", progress=30)
+            
+            # AI script generation based on options
+            gender = req.get("gender", "female")
+            char_type = req.get("character_type", "real")
+            p_name = req.get("product_name", "").strip() or "Sản phẩm cao cấp"
+            user_prompt = req.get("prompt", "").strip()
+
+            script_text = ""
+            if user_prompt:
+                script_text = user_prompt
+            else:
+
+                templates_female_real = [
+                    f"Chào mọi người nha! Hôm nay mình sẽ review cho các bạn sản phẩm {p_name} cực kỳ hot rần rần dạo gần đây. Thiết kế tinh tế, chất lượng xịn xò đỉnh cao luôn nha! Mọi người chần chừ gì nữa, nhanh tay bấm vào giỏ hàng bên dưới để săn ngay ưu đãi độc quyền hôm nay nha!",
+                    f"Hi mọi người, thần dược cho góc làm việc và cuộc sống của bạn đây rồi! Sản phẩm {p_name} này siêu tiện lợi, dùng là mê ngay. Đã có rất nhiều người mua và đánh giá 5 sao rồi nha. Mua ngay hôm nay để nhận thêm mã giảm giá nào!",
+                    f"Ôi trời ơi siêu phẩm {p_name} này hot khủng khủng luôn cả nhà ơi! Chất liệu bền đẹp, màu sắc sang trọng tôn vẻ sành điệu. Mọi người thả tim và chốt đơn ngay góc trái màn hình nha!"
+                ]
+                templates_male_real = [
+                    f"Anh em ơi, đây là mẫu {p_name} mà tôi đã tìm kiếm bấy lâu nay! Trải nghiệm thực tế cực kỳ đỉnh, vừa bền bỉ vừa mang phong cách hiện đại. Anh em nào quan tâm thì bấm ngay vào giỏ hàng để chốt deal ngon nhé!",
+                    f"Xin chào anh em, hôm nay lên sóng một chiếc {p_name} siêu chất cho mọi người. Đảm bảo chất lượng xuất sắc, bảo hành uy tín. Nhanh tay săn ngay số lượng có hạn!",
+                    f"Review chân thực về {p_name} cho các bạn đây. Cảm giác cầm nắm chắc chắn, công năng hoàn hảo đáng đồng tiền bát gạo. Đặt hàng ngay bên dưới nhé anh em!"
+                ]
+                templates_anime = [
+                    f"Woa~ Mọi người ơi xem này! Chiếc {p_name} xinh xắn đáng yêu hết nấc luôn nè! Nhìn là mê ngay từ cái nhìn đầu tiên luôn đó. Bấm vào giỏ hàng rinh em nó về nhà ngay thôi nào, yay~!",
+                    f"Konnichiwa! Hôm nay mình mang đến một siêu phẩm {p_name} cực kỳ phong cách anime nhé! Đẹp từ mọi góc nhìn, mua ngay kẻo hết nè các bạn ơi!"
+                ]
+
+                if char_type == "anime":
+                    script_text = random.choice(templates_anime)
+                elif gender == "male":
+                    script_text = random.choice(templates_male_real)
+                else:
+                    script_text = random.choice(templates_female_real)
+
+            # Check if Gemini/OpenAI API key exists for advanced script auto-generation
+            gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+            openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+            if not user_prompt:
+                if gemini_key:
+                    try:
+                        res_gem = translate_with_gemini(
+                            [f"Viết 1 đoạn kịch bản ngắn 3 câu bán hàng TikTok ấn tượng cho sản phẩm: {p_name}. Giọng điệu: {'Nữ' if gender=='female' else 'Nam'} {'hoạt hình Anime' if char_type=='anime' else 'người thật'}."],
+                            "vi", "vi"
+                        )
+                        if res_gem and len(res_gem) > 0 and len(res_gem[0]) > 20:
+                            script_text = res_gem[0].strip()
+                    except Exception:
+                        pass
+                elif openai_key:
+                    try:
+                        res_gpt = translate_with_openai(
+                            [f"Viết 1 đoạn kịch bản bán hàng TikTok 3 câu sinh động cho: {p_name} ({gender}, {char_type})."],
+                            "vi", "vi"
+                        )
+                        if res_gpt and len(res_gpt) > 0 and len(res_gpt[0]) > 20:
+                            script_text = res_gpt[0].strip()
+                    except Exception:
+                        pass
+
+            self.update(job_id, stage="tts", progress=50)
+
+            # Select Voice based on option choice if not explicitly given
+            chosen_voice = req.get("voice_id")
+            if not chosen_voice:
+                if gender == "male":
+                    chosen_voice = "vieneu:Gia Bảo"
+                else:
+                    chosen_voice = "vieneu:ngoc_huyen"
+
+            speech_file = work / "dub.mp3"
+            fake_translated = {
+                "segments": [
+                    {"start": 0.0, "end": 22.0, "text": script_text}
+                ]
+            }
+
+            self.tts.synthesize_segments(
+                fake_translated,
+                speech_file,
+                voice_id=chosen_voice,
+                target_language="vi"
+            )
+
+            self.update(job_id, stage="mix_and_render", progress=85)
+
+            # Get duration of audio speech file
+            duration_sec = 20.0
+            try:
+                from pydub import AudioSegment
+                audio_seg = AudioSegment.from_file(speech_file)
+                duration_sec = max(5.0, len(audio_seg) / 1000.0)
+            except Exception:
+                duration_sec = random.uniform(20.0, 25.0)
+
+            # Render Video: Pan & Zoom effect on product image + audio dubbing + burned subtitles
+            output_mp4 = work / "output.mp4"
+
+            # Create subtitle file
+            sub_srt = work / "subtitles.srt"
+            generate_srt([{"start": 0.5, "end": max(3.0, duration_sec - 0.5), "text": script_text}], sub_srt)
+
+            # Robust FFmpeg Command for Product Video Animation
+            cmd = [
+                "ffmpeg", "-y",
+                "-loop", "1", "-i", str(product_img_path),
+                "-i", str(speech_file),
+                "-vf", f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                "-t", f"{duration_sec:.2f}",
+                "-shortest",
+                str(output_mp4)
+            ]
+
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0 or not output_mp4.exists():
+                log_error_to_file(f"FFmpeg error: {res.stderr}", job_id=job_id)
+
+            self.update(
+                job_id,
+                status="completed",
+                stage="done",
+                progress=100,
+                output=str(output_mp4),
+            )
+        except Exception as exc:
+            err_msg = f"{type(exc).__name__}: {exc}"
+            self.update(
+                job_id,
+                status="failed",
+                stage="error",
+                error=err_msg,
+            )
+            req = job.get("request") if "job" in locals() and job else None
+            log_error_to_file(err_msg, exc=exc, job_id=job_id, context=req)
+
 def transcribe_with_groq(audio: Path, language: str | None = None) -> dict | None:
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:

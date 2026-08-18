@@ -12,16 +12,15 @@ if exist "tools\python_embed\python.exe" (
 )
 
 "%PY_CMD%" scripts\bundle_portable.py
-
-echo.
-echo ================================================================
-echo Ban co muon nen thu muc thanh file .ZIP ngay bay gio khong? (Y/N)
-echo ================================================================
-set /p user_choice="Chon (Y/N, mac dinh N): "
-if /i "%user_choice%"=="Y" (
-    "%PY_CMD%" scripts\create_zip.py
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Dong goi Windows Portable me loi! Dung qua trinh.
+    pause
+    exit /b 1
 )
 
 echo.
-echo Hoan tat!
+echo ================================================================
+echo Hoan tat! Thu muc xuat ra: AI-Video-Dubber-Portable
+echo ================================================================
 pause

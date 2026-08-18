@@ -49,6 +49,17 @@ class ProcessRequest(BaseModel):
     burn_subtitles: bool | None = True
 
 
+class ProductVideoRequest(BaseModel):
+    product_image_url: str | None = None
+    product_image_base64: str | None = None
+    product_name: str | None = ""
+    prompt: str | None = ""
+    count: int = 1
+    gender: str = "female" # female | male
+    character_type: str = "real" # real | anime
+    voice_id: str | None = None
+
+
 class SettingsUpdateRequest(BaseModel):
     groq_api_key: str | None = None
     gemini_api_key: str | None = None
@@ -94,6 +105,38 @@ def test_settings_api(req: TestApiRequest):
 @app.get("/api/voices")
 def voices():
     return manager.tts.list_voices()
+
+
+@app.post("/api/product-jobs")
+async def create_product_jobs(req: ProductVideoRequest):
+    count = max(1, min(req.count, 20))
+    batch_id = str(uuid.uuid4())
+    job_ids = []
+
+    for i in range(count):
+        job_id = str(uuid.uuid4())
+        job_ids.append(job_id)
+        job_req = {
+            "type": "product_video",
+            "batch_id": batch_id,
+            "index": i + 1,
+            "total": count,
+            "product_image_url": req.product_image_url,
+            "product_image_base64": req.product_image_base64,
+            "product_name": req.product_name,
+            "prompt": req.prompt,
+            "gender": req.gender,
+            "character_type": req.character_type,
+            "voice_id": req.voice_id,
+        }
+        manager.create(job_id, job_req)
+        asyncio.create_task(manager.run_product_job(job_id))
+
+    return {
+        "batch_id": batch_id,
+        "job_ids": job_ids,
+        "count": count
+    }
 
 
 @app.post("/api/jobs")
