@@ -295,29 +295,84 @@ class JobManager:
                 raw_img_path.write_bytes(img_bytes)
             elif req.get("product_image_url"):
                 img_url = req["product_image_url"].strip()
-                # Parse TikTok og_info param if available in url
-                import urllib.parse
-                parsed_url = urllib.parse.urlparse(img_url)
-                qs = urllib.parse.parse_qs(parsed_url.query)
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+                }
+
+                # 1. Parse TikTok link og_info URL parameter if present
                 extracted_img_url = None
-                if "og_info" in qs:
-                    try:
-                        og_data = json.loads(qs["og_info"][0])
+                try:
+                    import urllib.parse
+                    parsed_url = urllib.parse.urlparse(img_url)
+                    qs = urllib.parse.parse_qs(parsed_url.query)
+                    if "og_info" in qs:
+                        og_json_str = qs["og_info"][0]
+                        og_data = json.loads(og_json_str)
                         if "image" in og_data:
                             extracted_img_url = og_data["image"]
-                        if "title" in og_data and not req.get("product_name"):
+                        if "title" in og_data and (not req.get("product_name") or req.get("product_name") == "Sản phẩm cao cấp"):
                             req["product_name"] = og_data["title"]
-                    except Exception:
-                        pass
-                
-                target_url = extracted_img_url or img_url
-                if target_url.startswith("http"):
+                except Exception as ex:
+                    print(f"Error parsing og_info parameter: {ex}")
+
+                # If og_info provided direct image URL, fetch it immediately
+                if extracted_img_url:
                     try:
-                        resp = requests.get(target_url, timeout=15)
-                        if resp.status_code == 200:
-                            raw_img_path.write_bytes(resp.content)
-                    except Exception:
-                        pass
+                        img_resp = requests.get(extracted_img_url, headers=headers, timeout=15)
+                        if img_resp.status_code == 200 and len(img_resp.content) > 500:
+                            raw_img_path.write_bytes(img_resp.content)
+                    except Exception as e:
+                        print(f"Error fetching og_info image: {e}")
+
+                if not raw_img_path.exists() or raw_img_path.stat().st_size < 500:
+                    # 2. Check if URL is directly pointing to an image file
+                    is_direct_image = any(img_url.lower().rsplit("?", 1)[0].endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"])
+                    if is_direct_image:
+                        try:
+                            resp = requests.get(img_url, headers=headers, timeout=15)
+                            if resp.status_code == 200 and len(resp.content) > 500:
+                                raw_img_path.write_bytes(resp.content)
+                        except Exception as e:
+                            print(f"Direct image fetch exception: {e}")
+                    else:
+                        # 3. Web Scraper: Parse Webpage HTML for Product Image & Title
+                        try:
+                            resp = requests.get(img_url, headers=headers, timeout=15)
+                            if resp.status_code == 200:
+                                html_text = resp.text
+                                og_matches = re.findall(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+                                if not og_matches:
+                                    og_matches = re.findall(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html_text, re.IGNORECASE)
+                                if not og_matches:
+                                    og_matches = re.findall(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+                                
+                                title_match = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+                                if title_match and not req.get("product_name"):
+                                    req["product_name"] = title_match.group(1).strip()
+
+                                found_img_url = og_matches[0] if og_matches else None
+                                if not found_img_url:
+                                    img_srcs = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+                                    for src in img_srcs:
+                                        if any(kw in src.lower() for kw in ["product", "goods", "item", "cover", "origin", "720x720", "1080x1080"]):
+                                            found_img_url = src
+                                            break
+                                    if not found_img_url and img_srcs:
+                                        found_img_url = img_srcs[0]
+                                
+                                if found_img_url:
+                                    if found_img_url.startswith("//"):
+                                        found_img_url = "https:" + found_img_url
+                                    elif found_img_url.startswith("/"):
+                                        import urllib.parse
+                                        found_img_url = urllib.parse.urljoin(img_url, found_img_url)
+
+                                    img_resp = requests.get(found_img_url, headers=headers, timeout=15)
+                                    if img_resp.status_code == 200 and len(img_resp.content) > 500:
+                                        raw_img_path.write_bytes(img_resp.content)
+                        except Exception as e:
+                            print(f"Webpage product scraper exception: {e}")
 
             product_img_path = work / "product_source.png"
             loaded_ok = False
@@ -331,12 +386,17 @@ class JobManager:
                     loaded_ok = False
 
             if not loaded_ok or not product_img_path.exists():
-                # Create a fallback placeholder image with canvas gradient
-                from PIL import Image, ImageDraw
-                img = Image.new("RGB", (1080, 1920), color=(20, 20, 35))
+                # Create an attractive gradient fallback card image
+                from PIL import Image, ImageDraw, ImageFont
+                img = Image.new("RGB", (1080, 1920), color=(114, 9, 183))
                 draw = ImageDraw.Draw(img)
-                draw.rectangle([40, 40, 1040, 1880], outline=(139, 92, 246), width=10)
-                draw.text((300, 900), "PRODUCT SHOWCASE AI", fill=(255, 255, 255))
+                # Inner border & glow
+                draw.rectangle([30, 30, 1050, 1890], outline=(247, 37, 133), width=16)
+                draw.rectangle([60, 60, 1020, 1860], fill=(56, 4, 116))
+                
+                display_title = (p_name or "AI PRODUCT SHOWCASE").upper()
+                draw.text((150, 850), "🛍️ SIÊU PHẨM AI REVIEW", fill=(255, 215, 0))
+                draw.text((150, 950), display_title[:35], fill=(255, 255, 255))
                 img.save(product_img_path, "PNG")
 
             self.update(job_id, stage="generate_script", progress=30)
@@ -346,58 +406,79 @@ class JobManager:
             char_type = req.get("character_type", "real")
             p_name = req.get("product_name", "").strip() or "Sản phẩm cao cấp"
             user_prompt = req.get("prompt", "").strip()
+            custom_script = req.get("custom_script", "").strip()
 
             script_text = ""
-            if user_prompt:
-                script_text = user_prompt
-            else:
 
+            # 1. Nếu người dùng tự nhập Lời Thoại trực tiếp -> Dùng luôn lời thoại đó
+            if custom_script:
+                script_text = custom_script
+            else:
+                # 2. Nếu không nhập lời thoại, chuẩn bị kịch bản mặc định
                 templates_female_real = [
-                    f"Chào mọi người nha! Hôm nay mình sẽ review cho các bạn sản phẩm {p_name} cực kỳ hot rần rần dạo gần đây. Thiết kế tinh tế, chất lượng xịn xò đỉnh cao luôn nha! Mọi người chần chừ gì nữa, nhanh tay bấm vào giỏ hàng bên dưới để săn ngay ưu đãi độc quyền hôm nay nha!",
-                    f"Hi mọi người, thần dược cho góc làm việc và cuộc sống của bạn đây rồi! Sản phẩm {p_name} này siêu tiện lợi, dùng là mê ngay. Đã có rất nhiều người mua và đánh giá 5 sao rồi nha. Mua ngay hôm nay để nhận thêm mã giảm giá nào!",
-                    f"Ôi trời ơi siêu phẩm {p_name} này hot khủng khủng luôn cả nhà ơi! Chất liệu bền đẹp, màu sắc sang trọng tôn vẻ sành điệu. Mọi người thả tim và chốt đơn ngay góc trái màn hình nha!"
+                    f"Chào cả nhà nha! Hôm nay mình ngoi lên đây để trực tiếp trên tay và review cho mọi người chiếc siêu phẩm {p_name} đang cực kỳ rầm rộ thời gian qua. Cảm nhận đầu tiên của mình khi cầm trên tay là thiết kế cực kỳ tỉ mỉ, chất liệu cao cấp và cảm giác sử dụng vô cùng mượt mà. Phải công nhận là đáng đồng tiền bát gạo luôn cả nhà ạ! Ai mà đang đắn đo thì không phải lo lắng đâu nha. Hiện tại shop đang có chương trình trợ giá khủng số lượng có hạn, mọi người nhanh tay bấm ngay vào giỏ hàng góc trái màn hình để săn deal hời hôm nay nhé!",
+                    f"Hi mọi người, thần dược cho cuộc sống hiện đại và nâng tầm trải nghiệm của bạn đây rồi! Hôm nay mình đang cầm trên tay em {p_name} này siêu tiện lợi, giải quyết ngay mọi vấn đề bạn gặp phải hàng ngày. Đã có hàng ngàn khách hàng mua và đánh giá năm sao tuyệt đối luôn đó nha. Chất lượng thì đỉnh khỏi bàn, dùng là mê ngay. Duy nhất trong hôm nay shop dành tặng voucher giảm giá độc quyền cho ai nhanh tay nhất, bấm vào giỏ hàng chốt đơn ngay kẻo hết quà nha!",
+                    f"Ôi trời ơi chiếc siêu phẩm {p_name} này hot khủng khiếp luôn cả nhà ơi! Mình đang cầm em nó trên tay để review cho cả nhà đây. Trải nghiệm thực tế suốt tuần qua khiến mình thực sự bị thuyết phục hoàn toàn. Không chỉ đẹp mắt, sang trọng mà công năng còn cực kỳ thông minh vượt trội. Bạn nào muốn sở hữu một sản phẩm chất lượng chuẩn chỉnh với mức giá hời nhất thì chần chừ gì nữa, thả tim và bấm ngay giỏ hàng bên dưới để rinh em nó về nhà ngay hôm nay nha!"
                 ]
                 templates_male_real = [
-                    f"Anh em ơi, đây là mẫu {p_name} mà tôi đã tìm kiếm bấy lâu nay! Trải nghiệm thực tế cực kỳ đỉnh, vừa bền bỉ vừa mang phong cách hiện đại. Anh em nào quan tâm thì bấm ngay vào giỏ hàng để chốt deal ngon nhé!",
-                    f"Xin chào anh em, hôm nay lên sóng một chiếc {p_name} siêu chất cho mọi người. Đảm bảo chất lượng xuất sắc, bảo hành uy tín. Nhanh tay săn ngay số lượng có hạn!",
-                    f"Review chân thực về {p_name} cho các bạn đây. Cảm giác cầm nắm chắc chắn, công năng hoàn hảo đáng đồng tiền bát gạo. Đặt hàng ngay bên dưới nhé anh em!"
+                    f"Anh em ơi, đây chính là mẫu {p_name} mà tôi đang cầm trên tay và đã cất công tìm kiếm bấy lâu nay! Trải nghiệm thực tế phải nói là cực kỳ đỉnh, vừa bền bỉ chắc chắn lại mang phong cách vô cùng hiện đại và cá tính. Mọi chi tiết đều được hoàn thiện cực tốt, đáng tiền tới từng đồng. Đảm bảo anh em sở hữu là thích ngay. Số lượng ưu đãi có hạn nên anh em nào quan tâm thì bấm ngay vào giỏ hàng bên dưới để chốt deal ngon ngay nhé!",
+                    f"Xin chào anh em, hôm nay trên tay một chiếc {p_name} siêu chất review trực tiếp cho mọi người đây. Cảm giác cầm nắm đầm tay, tính năng thông minh vượt trội hơn hẳn các dòng khác trên thị trường. Đã được thử nghiệm thực tế và đánh giá rất cao. Shop cam kết bảo hành uy tín và hỗ trợ chu đáo. Nhanh tay bấm vào giỏ hàng góc trái để săn ngay mức giá ưu đãi tốt nhất hôm nay nào!",
+                    f"Review chân thực về sản phẩm {p_name} trên tay cho các bạn đây. Nếu bạn đang tìm kiếm một sản phẩm vừa bền, vừa tinh tế lại tối ưu hiệu năng thì đây chắc chắn là sự lựa chọn số một. Trải nghiệm thực tế vô cùng mượt mà và hài lòng. Mua ngay hôm nay để nhận thêm mã miễn phí vận chuyển toàn quốc, click ngay vào giỏ hàng bên dưới để nhận ưu đãi nhé anh em!"
                 ]
-                templates_anime = [
-                    f"Woa~ Mọi người ơi xem này! Chiếc {p_name} xinh xắn đáng yêu hết nấc luôn nè! Nhìn là mê ngay từ cái nhìn đầu tiên luôn đó. Bấm vào giỏ hàng rinh em nó về nhà ngay thôi nào, yay~!",
-                    f"Konnichiwa! Hôm nay mình mang đến một siêu phẩm {p_name} cực kỳ phong cách anime nhé! Đẹp từ mọi góc nhìn, mua ngay kẻo hết nè các bạn ơi!"
+                templates_cat_anime = [
+                    f"Meow meow~ Chào các bạn nha! Hôm nay bé mèo AI đáng yêu đang ôm trên tay chiếc {p_name} xinh xắn hết nấc luôn nè! Nhìn là mê ngay từ cái nhìn đầu tiên luôn đó nha. Chất lượng siêu xịn xò, màu sắc tươi tắn tôn lên vẻ cá tính vô cùng. Dùng hàng ngày là thích mê luôn! Đang có ưu đãi hấp dẫn cực lớn dành riêng cho bạn đó, bấm ngay vào giỏ hàng rinh em nó về nhà ngay cùng bé mèo thôi nào, meow~!",
+                    f"Konnichiwa meow! Mèo xinh ngoi lên đây review cho cả nhà siêu phẩm {p_name} cực kỳ phong cách và dễ thương nè! Bé mèo đang cầm em nó trên tay mà thích mê luôn đó. Đẹp từ mọi góc nhìn, tính năng thì tiện lợi đỉnh cao. Đừng bỏ lỡ cơ hội săn em nó với giá cực hời hôm nay nha, chốt đơn ngay ở giỏ hàng góc dưới thôi các bạn ơi, meow meow!"
                 ]
 
                 if char_type == "anime":
-                    script_text = random.choice(templates_anime)
+                    script_text = random.choice(templates_cat_anime)
                 elif gender == "male":
                     script_text = random.choice(templates_male_real)
                 else:
                     script_text = random.choice(templates_female_real)
 
-            # Check if Gemini/OpenAI API key exists for advanced script auto-generation
-            gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-            openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-            if not user_prompt:
-                if gemini_key:
-                    try:
-                        res_gem = translate_with_gemini(
-                            [f"Viết 1 đoạn kịch bản ngắn 3 câu bán hàng TikTok ấn tượng cho sản phẩm: {p_name}. Giọng điệu: {'Nữ' if gender=='female' else 'Nam'} {'hoạt hình Anime' if char_type=='anime' else 'người thật'}."],
-                            "vi", "vi"
-                        )
-                        if res_gem and len(res_gem) > 0 and len(res_gem[0]) > 20:
-                            script_text = res_gem[0].strip()
-                    except Exception:
-                        pass
-                elif openai_key:
-                    try:
-                        res_gpt = translate_with_openai(
-                            [f"Viết 1 đoạn kịch bản bán hàng TikTok 3 câu sinh động cho: {p_name} ({gender}, {char_type})."],
-                            "vi", "vi"
-                        )
-                        if res_gpt and len(res_gpt) > 0 and len(res_gpt[0]) > 20:
-                            script_text = res_gpt[0].strip()
-                    except Exception:
-                        pass
+                # 3. Sử dụng Prompt làm chỉ dẫn cho AI sáng tạo kịch bản nếu có
+                gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+                openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+                role_desc = "Bé mèo AI hoạt hình đáng yêu meow meow đang ôm trên tay sản phẩm" if char_type=="anime" else f"KOL người {'Nữ' if gender=='female' else 'Nam'} đang cầm trên tay sản phẩm"
+
+                if user_prompt:
+                    ai_instruction = f"Viết 1 kịch bản lời thoại review bán hàng TikTok 20-25 giây (60-75 từ) cho sản phẩm: {p_name}. Nhập vai: {role_desc}. YÊU CẦU BỐI CẢNH/NỘI DUNG TỪ NGUỜI DÙNG: '{user_prompt}'. Phải sinh ra LỜI THOẠI ĐỌC REVIEW (có chào hỏi, khen sản phẩm, kêu gọi bấm giỏ hàng mua), KHÔNG ĐƯỢC đọc lại trực tiếp câu yêu cầu của người dùng."
+                    if gemini_key:
+                        try:
+                            res_gem = translate_with_gemini([ai_instruction], "vi", "vi")
+                            if res_gem and len(res_gem) > 0 and len(res_gem[0]) > 20:
+                                script_text = res_gem[0].strip()
+                        except Exception:
+                            pass
+                    elif openai_key:
+                        try:
+                            res_gpt = translate_with_openai([ai_instruction], "vi", "vi")
+                            if res_gpt and len(res_gpt) > 0 and len(res_gpt[0]) > 20:
+                                script_text = res_gpt[0].strip()
+                        except Exception:
+                            pass
+                else:
+                    if gemini_key:
+                        try:
+                            res_gem = translate_with_gemini(
+                                [f"Viết 1 kịch bản review bán hàng TikTok thu hút dài 60-75 từ (20-25 giây đọc). Nhập vai: {role_desc} review sản phẩm: {p_name}. Có lời chào lôi cuốn, câu thể hiện đang cầm sản phẩm trên tay review khen chất lượng đỉnh cao và kết thúc bằng câu kêu gọi bấm vào giỏ hàng mua ngay."],
+                                "vi", "vi"
+                            )
+                            if res_gem and len(res_gem) > 0 and len(res_gem[0]) > 20:
+                                script_text = res_gem[0].strip()
+                        except Exception:
+                            pass
+                    elif openai_key:
+                        try:
+                            res_gpt = translate_with_openai(
+                                [f"Viết 1 kịch bản review sản phẩm TikTok 60-75 từ (20-25s). Nhập vai: {role_desc} review {p_name}. Có đoạn chào hỏi -> trên tay trải nghiệm thực tế xuất sắc -> kêu gọi mua ngay ở giỏ hàng."],
+                                "vi", "vi"
+                            )
+                            if res_gpt and len(res_gpt) > 0 and len(res_gpt[0]) > 20:
+                                script_text = res_gpt[0].strip()
+                        except Exception:
+                            pass
 
             self.update(job_id, stage="tts", progress=50)
 
@@ -437,26 +518,74 @@ class JobManager:
             # Render Video: Pan & Zoom effect on product image + audio dubbing + burned subtitles
             output_mp4 = work / "output.mp4"
 
-            # Create subtitle file
+            # Split script into natural short sentences sync-ready
+            import re
+            raw_sentences = [s.strip() for s in re.split(r'[.!?,;]+', script_text) if len(s.strip()) > 3]
+            if not raw_sentences:
+                raw_sentences = [script_text]
+
+            # Assign timed segments proportionally matching speech duration
+            time_per_sentence = duration_sec / max(1, len(raw_sentences))
+            segments_data = []
+            curr_t = 0.5
+            for sentence in raw_sentences:
+                dur = min(4.5, max(1.8, len(sentence) * 0.18))
+                end_t = min(duration_sec - 0.2, curr_t + dur)
+                segments_data.append({"start": round(curr_t, 2), "end": round(end_t, 2), "text": sentence})
+                curr_t = end_t + 0.15
+
+            # Create subtitle file (SRT & ASS at bottom of screen with small clean font)
             sub_srt = work / "subtitles.srt"
-            generate_srt([{"start": 0.5, "end": max(3.0, duration_sec - 0.5), "text": script_text}], sub_srt)
+            generate_srt(segments_data, sub_srt)
 
-            # Robust FFmpeg Command for Product Video Animation
-            cmd = [
-                "ffmpeg", "-y",
-                "-loop", "1", "-i", str(product_img_path),
-                "-i", str(speech_file),
-                "-vf", f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "192k",
-                "-t", f"{duration_sec:.2f}",
-                "-shortest",
-                str(output_mp4)
-            ]
+            # Option to burn subtitle or hide (Default: hide or bottom screen)
+            burn_sub = req.get("burn_subtitles", False)
 
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode != 0 or not output_mp4.exists():
-                log_error_to_file(f"FFmpeg error: {res.stderr}", job_id=job_id)
+            ass_sub_path = work / "subtitles.ass"
+            if burn_sub:
+                generate_ass(segments_data, ass_sub_path, style_type="yellow")
+
+            # Render Dynamic AI Talking Reviewer Video (Top: Speaking Character, Bottom: Product)
+            from .avatar_animator import generate_talking_reviewer_video
+            rendered_ok = False
+            try:
+                rendered_ok = generate_talking_reviewer_video(
+                    audio_path=speech_file,
+                    product_img_path=product_img_path,
+                    output_video_path=output_mp4,
+                    char_type=char_type,
+                    gender=gender,
+                    product_name=p_name,
+                    subtitles_ass_path=ass_sub_path if (burn_sub and ass_sub_path.exists()) else None,
+                    fps=25
+                )
+            except Exception as e:
+                log_error_to_file(f"Avatar animator error: {e}", job_id=job_id)
+                rendered_ok = False
+
+            if not rendered_ok or not output_mp4.exists():
+                # Fallback to FFmpeg ZoomPan if animator fails
+                zoom_modes = [
+                    "zoompan=z='min(zoom+0.0015,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=125:s=1080x1920",
+                    "zoompan=z='max(1.25-0.0015,1.0)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=125:s=1080x1920",
+                ]
+                vf_filter = f"{random.choice(zoom_modes)},scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+                if burn_sub and ass_sub_path.exists():
+                    safe_ass = str(ass_sub_path).replace("\\", "/").replace(":", "\\:")
+                    vf_filter += f",ass='{safe_ass}'"
+
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-loop", "1", "-i", str(product_img_path),
+                    "-i", str(speech_file),
+                    "-vf", vf_filter,
+                    "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-t", f"{duration_sec:.2f}",
+                    "-shortest",
+                    str(output_mp4)
+                ]
+                subprocess.run(cmd, capture_output=True, text=True)
 
             self.update(
                 job_id,

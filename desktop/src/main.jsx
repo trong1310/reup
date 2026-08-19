@@ -37,6 +37,8 @@ function App() {
   const [productImagePreview, setProductImagePreview] = useState("");
   const [productName, setProductName] = useState("");
   const [productPrompt, setProductPrompt] = useState("");
+  const [productCustomScript, setProductCustomScript] = useState("");
+  const [productBurnSubtitles, setProductBurnSubtitles] = useState(false);
   const [videoCount, setVideoCount] = useState(1);
   const [genderOption, setGenderOption] = useState("female"); // "female" | "male"
   const [characterTypeOption, setCharacterTypeOption] = useState("real"); // "real" | "anime"
@@ -216,10 +218,12 @@ function App() {
           product_image_base64: productInputType === "file" ? productImageBase64 : null,
           product_name: productName,
           prompt: productPrompt,
+          custom_script: productCustomScript,
           count: parseInt(videoCount, 10) || 1,
           gender: genderOption,
           character_type: characterTypeOption,
-          voice_id: productVoiceId || null
+          voice_id: productVoiceId || null,
+          burn_subtitles: productBurnSubtitles
         })
       });
 
@@ -496,32 +500,58 @@ function App() {
                 </div>
               </div>
 
-              <div className="margin-top-sm">
-                <label>Kịch Bản / Prompt Nội Dung (Nếu bỏ trống AI sẽ tự suy nghĩ ngẫu nhiên kịch bản viral)</label>
-                <textarea
-                  rows="3"
-                  value={productPrompt}
-                  onChange={(e) => setProductPrompt(e.target.value)}
-                  placeholder="Nhập ý tưởng kịch bản... Hoặc bỏ trống để AI tự tạo kịch bản hấp dẫn 20-25 giây!"
-                />
+              <div className="grid-2col margin-top-sm">
+                <div>
+                  <label>✍️ Lời Thoại Trực Tiếp (Đọc chính xác câu bạn nhập nếu có)</label>
+                  <textarea
+                    rows="3"
+                    value={productCustomScript}
+                    onChange={(e) => setProductCustomScript(e.target.value)}
+                    placeholder="Nhập chính xác lời thoại muốn lồng tiếng (ví dụ: Chào bạn, hôm nay mình trên tay...)"
+                  />
+                </div>
+
+                <div>
+                  <label>💡 Prompt Chỉ Dẫn Cho AI (Gợi ý bối cảnh/phong cách)</label>
+                  <textarea
+                    rows="3"
+                    value={productPrompt}
+                    onChange={(e) => setProductPrompt(e.target.value)}
+                    placeholder="Ví dụ: Giọng đọc hài hước, nhấn mạnh giảm giá 50%, dành cho học sinh sinh viên..."
+                  />
+                </div>
               </div>
 
-              <div className="margin-top-sm">
-                <label>Giọng Đọc AI Cao Cấp</label>
-                <select
-                  value={productVoiceId}
-                  onChange={(e) => setProductVoiceId(e.target.value)}
-                >
-                  {Object.entries(groupedVoices).map(([cat, list]) => (
-                    <optgroup label={`─── ${cat} ───`} key={cat}>
-                      {list.map(v => (
-                        <option value={v.id} key={v.id}>
-                          {v.name}
-                        </option>
-                      ))}
-                    </optgroup>
-                  ))}
-                </select>
+              <div className="grid-2col margin-top-sm">
+                <div>
+                  <label>Giọng Đọc AI Cao Cấp</label>
+                  <select
+                    value={productVoiceId}
+                    onChange={(e) => setProductVoiceId(e.target.value)}
+                  >
+                    {Object.entries(groupedVoices).map(([cat, list]) => (
+                      <optgroup label={`─── ${cat} ───`} key={cat}>
+                        {list.map(v => (
+                          <option value={v.id} key={v.id}>
+                            {v.name}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", marginTop: "24px" }}>
+                  <label style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: "8px" }}>
+                    <input
+                      type="checkbox"
+                      checked={productBurnSubtitles}
+                      onChange={(e) => setProductBurnSubtitles(e.target.checked)}
+                      style={{ width: "18px", height: "18px" }}
+                    />
+                    📝 Ghép Phụ Đề Chữ Trên Video (Mặc định TẮT để mượt video)
+                  </label>
+                </div>
               </div>
 
               <button

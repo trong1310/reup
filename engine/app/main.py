@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import uuid
 from pathlib import Path
+
+# Fix Windows Proactor ConnectionResetError [WinError 10054] noisy exceptions
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,10 +59,12 @@ class ProductVideoRequest(BaseModel):
     product_image_base64: str | None = None
     product_name: str | None = ""
     prompt: str | None = ""
+    custom_script: str | None = ""
     count: int = 1
     gender: str = "female" # female | male
     character_type: str = "real" # real | anime
     voice_id: str | None = None
+    burn_subtitles: bool = False
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -125,9 +132,11 @@ async def create_product_jobs(req: ProductVideoRequest):
             "product_image_base64": req.product_image_base64,
             "product_name": req.product_name,
             "prompt": req.prompt,
+            "custom_script": req.custom_script,
             "gender": req.gender,
             "character_type": req.character_type,
             "voice_id": req.voice_id,
+            "burn_subtitles": req.burn_subtitles,
         }
         manager.create(job_id, job_req)
         asyncio.create_task(manager.run_product_job(job_id))

@@ -18,7 +18,7 @@ if exist "%~dp0tools\python_embed\python.exe" (
 )
 
 echo [2/2] Launching Desktop App (Vite + Electron)...
-start "AI Video Dubber - Desktop App" cmd /k "cd /d %~dp0desktop && npm run dev"
+start "AI Video Dubber - Desktop App" cmd /c "cd /d %~dp0desktop && npm run dev"
 
 echo.
 echo All services launched!
